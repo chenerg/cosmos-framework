@@ -17,14 +17,17 @@ from cosmos_framework.utils.generator.parallelism import ParallelDims
 def build_vfm_fsdp_mixed_precision_policy(
     parallelism_config: ParallelismConfig,
     precision: str,
+    *,
+    cast_forward_inputs: bool,
 ) -> MixedPrecisionPolicy | None:
-    """Build the opt-in VFM FSDP2 policy without changing legacy runs."""
+    """Build an opt-in VFM FSDP2 policy without changing legacy runs."""
 
     if not parallelism_config.fsdp_mixed_precision_enabled:
         return None
     return MixedPrecisionPolicy(
         param_dtype=PRECISION_TO_TORCH_DTYPE[precision],
         reduce_dtype=PRECISION_TO_TORCH_DTYPE[parallelism_config.fsdp_master_dtype],
+        cast_forward_inputs=cast_forward_inputs,
     )
 
 
@@ -105,7 +108,20 @@ def parallelize_vfm_network(
     if parallel_dims is not None and parallel_dims.cp_enabled:
         model.parallel_dims = parallel_dims
 
-    mp_policy = build_vfm_fsdp_mixed_precision_policy(parallelism_config, precision)
+    # The root receives a structured PackedSequence containing floating-point
+    # metadata (notably diffusion timesteps) that must remain fp32. Nested MoT
+    # blocks receive ordinary hidden-state tensors and should retain FSDP's
+    # automatic cast to the bf16 compute dtype.
+    root_mp_policy = build_vfm_fsdp_mixed_precision_policy(
+        parallelism_config,
+        precision,
+        cast_forward_inputs=False,
+    )
+    block_mp_policy = build_vfm_fsdp_mixed_precision_policy(
+        parallelism_config,
+        precision,
+        cast_forward_inputs=True,
+    )
 
     model.language_model = parallelize_unified_mot(
         model.language_model,
@@ -113,7 +129,7 @@ def parallelize_vfm_network(
         compile_config=compile_config,
         ac_config=ac_config,
         attention_io_layout=attention_io_layout,
-        fsdp_mixed_precision_policy=mp_policy,
+        fsdp_mixed_precision_policy=block_mp_policy,
     )
 
     if compile_config.enabled and compile_config.compiled_region == "all":
@@ -127,7 +143,7 @@ def parallelize_vfm_network(
             module=model,
             mesh=parallel_dims.dp_mesh,
             ignored_params=ignored_params,
-            mp_policy=mp_policy,
+            mp_policy=root_mp_policy,
         )
 
         # Make ``model.generate_reasoner_text(...)`` trigger the same

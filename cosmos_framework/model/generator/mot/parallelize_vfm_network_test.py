@@ -19,7 +19,9 @@ from cosmos_framework.model.generator.mot.parallelize_vfm_network import (
 def test_vfm_fsdp_mixed_precision_is_opt_in() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=False, fsdp_master_dtype="float32")
 
-    assert build_vfm_fsdp_mixed_precision_policy(config, "bfloat16") is None
+    assert (
+        build_vfm_fsdp_mixed_precision_policy(config, "bfloat16", cast_forward_inputs=False) is None
+    )
     assert (
         resolve_vfm_parameter_storage_dtype(torch.bfloat16, config, fsdp_enabled=True) is torch.bfloat16
     )
@@ -28,17 +30,18 @@ def test_vfm_fsdp_mixed_precision_is_opt_in() -> None:
 def test_vfm_fsdp_mixed_precision_uses_bf16_compute_and_fp32_storage() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=True, fsdp_master_dtype="float32")
 
-    policy = build_vfm_fsdp_mixed_precision_policy(config, "bfloat16")
+    policy = build_vfm_fsdp_mixed_precision_policy(config, "bfloat16", cast_forward_inputs=False)
 
     assert policy is not None
     assert policy.param_dtype is torch.bfloat16
     assert policy.reduce_dtype is torch.float32
+    assert policy.cast_forward_inputs is False
     assert resolve_vfm_parameter_storage_dtype(torch.bfloat16, config, fsdp_enabled=True) is torch.float32
     # The switch must not silently turn a non-FSDP run into full-fp32 training.
     assert resolve_vfm_parameter_storage_dtype(torch.bfloat16, config, fsdp_enabled=False) is torch.bfloat16
 
 
-def test_parallelize_vfm_passes_one_policy_to_nested_and_root_fsdp() -> None:
+def test_parallelize_vfm_preserves_root_inputs_and_casts_nested_block_inputs() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=True, fsdp_master_dtype="float32")
     model = SimpleNamespace(language_model=object())
     parallel_dims = SimpleNamespace(cp_enabled=False, dp_enabled=True, dp_mesh=object())
@@ -67,9 +70,13 @@ def test_parallelize_vfm_passes_one_policy_to_nested_and_root_fsdp() -> None:
     nested_policy = parallelize_mot.call_args.kwargs["fsdp_mixed_precision_policy"]
     root_policy = fully_shard.call_args.kwargs["mp_policy"]
     assert result is model
-    assert nested_policy is root_policy
+    assert nested_policy is not root_policy
     assert root_policy.param_dtype is torch.bfloat16
     assert root_policy.reduce_dtype is torch.float32
+    assert root_policy.cast_forward_inputs is False
+    assert nested_policy.param_dtype is torch.bfloat16
+    assert nested_policy.reduce_dtype is torch.float32
+    assert nested_policy.cast_forward_inputs is True
 
 
 class _TinyMoT(nn.Module):
@@ -81,7 +88,7 @@ class _TinyMoT(nn.Module):
 
 def test_nested_mot_fsdp_units_receive_mixed_precision_policy() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=True, fsdp_master_dtype="float32")
-    policy = build_vfm_fsdp_mixed_precision_policy(config, "bfloat16")
+    policy = build_vfm_fsdp_mixed_precision_policy(config, "bfloat16", cast_forward_inputs=True)
     model = _TinyMoT()
     parallel_dims = SimpleNamespace(dp_mesh=object())
 

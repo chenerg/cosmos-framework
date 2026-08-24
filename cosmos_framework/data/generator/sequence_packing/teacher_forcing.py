@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +23,10 @@ class TeacherForcingStream(IntEnum):
     UND = -1
     CLEAN = 0
     NOISY = 1
+
+
+def _empty_long_tensor() -> torch.LongTensor:
+    return torch.empty(0, dtype=torch.long)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,11 @@ class TeacherForcingLayout:
     gen_query_indexes: torch.LongTensor
     clean_token_indexes: torch.LongTensor
     noisy_output_indexes: torch.LongTensor
+    # Action-stream metadata (empty for vision-only layouts). Vision clean slots
+    # stay in ``clean_token_indexes``; action clean slots live here so the
+    # network can scatter each modality's clean payload independently.
+    clean_action_token_indexes: torch.LongTensor = field(default_factory=_empty_long_tensor)
+    noisy_action_output_indexes: torch.LongTensor = field(default_factory=_empty_long_tensor)
 
     def to(self, device: torch.device | str) -> TeacherForcingLayout:
         """Return a copy with all tensor metadata moved to ``device``."""
@@ -55,6 +64,8 @@ class TeacherForcingLayout:
             gen_query_indexes=self.gen_query_indexes.to(device=device),
             clean_token_indexes=self.clean_token_indexes.to(device=device),
             noisy_output_indexes=self.noisy_output_indexes.to(device=device),
+            clean_action_token_indexes=self.clean_action_token_indexes.to(device=device),
+            noisy_action_output_indexes=self.noisy_action_output_indexes.to(device=device),
         )
 
 
@@ -64,12 +75,17 @@ class TeacherForcingData:
 
     layout: TeacherForcingLayout
     clean_vision_tokens: list[torch.Tensor]
+    # Clean action payloads (one per packed sample) for V+A causal training.
+    # None for vision-only teacher forcing.
+    clean_action_tokens: list[torch.Tensor] | None = None
 
     def to_cuda(self) -> None:
         """Move clean payloads and layout tensors to CUDA/NPU in-place."""
 
         self.layout = self.layout.to("cuda")
         self.clean_vision_tokens = [token.cuda() for token in self.clean_vision_tokens]
+        if self.clean_action_tokens is not None:
+            self.clean_action_tokens = [token.cuda() for token in self.clean_action_tokens]
 
 
 def _validate_inclusive_range(name: str, minimum: int, maximum: int) -> None:
@@ -101,14 +117,50 @@ def sample_teacher_forcing_parameters(
     return block_size, history_blocks
 
 
+def assign_action_steps_to_latent_frames(
+    num_action_steps: int,
+    num_latent_frames: int,
+    temporal_compression_factor: int,
+) -> list[int]:
+    """Map each action step to its VAE latent frame under offset-0 alignment.
+
+    Action step ``j`` sits at raw frame ``j`` (``action_start_frame_offset=0``).
+    The causal Wan VAE maps raw frame 0 to latent frame 0 and raw frames
+    ``cf*(k-1)+1 .. cf*k`` to latent frame ``k``, so
+    ``latent_frame(j) = ceil(j / cf)``.
+    """
+
+    if temporal_compression_factor < 1:
+        raise ValueError(f"temporal_compression_factor must be >= 1, got {temporal_compression_factor}")
+    latent_frames = [
+        (step + temporal_compression_factor - 1) // temporal_compression_factor for step in range(num_action_steps)
+    ]
+    if latent_frames and latent_frames[-1] > num_latent_frames - 1:
+        raise ValueError(
+            f"action steps extend beyond the video: step {num_action_steps - 1} maps to latent frame "
+            f"{latent_frames[-1]} but the video only has {num_latent_frames} latent frames"
+        )
+    return latent_frames
+
+
 def build_teacher_forcing_layout(
     *,
     und_token_counts: Sequence[int],
     vision_token_shapes: Sequence[tuple[int, int, int]],
     block_size: int,
     history_blocks: int,
+    action_token_counts: Sequence[int] | None = None,
+    temporal_compression_factor: int | None = None,
 ) -> TeacherForcingLayout:
-    """Build batch metadata for ``[UND | clean vision | noisy vision]`` samples."""
+    """Build batch metadata for dual-stream teacher-forcing samples.
+
+    Vision-only samples expand to ``[UND | clean vision | noisy vision]``.
+    When ``action_token_counts`` is provided, each GEN stream is interleaved
+    per causal block: ``[UND | clean: V_b0 A_b0 V_b1 A_b1 ... | noisy: ...]``.
+    Action steps are assigned to blocks through their physical VAE latent
+    frame (``assign_action_steps_to_latent_frames``), assuming
+    ``action_start_frame_offset=0``.
+    """
 
     if len(und_token_counts) != len(vision_token_shapes):
         raise ValueError(
@@ -121,6 +173,14 @@ def build_teacher_forcing_layout(
         raise ValueError(f"block_size must be >= 1, got {block_size}")
     if history_blocks < 1:
         raise ValueError(f"history_blocks must be >= 1, got {history_blocks}")
+    if action_token_counts is not None:
+        if len(action_token_counts) != len(und_token_counts):
+            raise ValueError(
+                "action_token_counts must contain one entry per sample, "
+                f"got {len(action_token_counts)} and {len(und_token_counts)}"
+            )
+        if temporal_compression_factor is None:
+            raise ValueError("temporal_compression_factor is required when action_token_counts is provided")
 
     original_sample_lens: list[int] = []
     sample_lens: list[int] = []
@@ -132,7 +192,9 @@ def build_teacher_forcing_layout(
     block_ids: list[int] = []
     gen_query_indexes: list[int] = []
     clean_token_indexes: list[int] = []
+    clean_action_token_indexes: list[int] = []
     noisy_output_indexes: list[int] = []
+    noisy_action_output_indexes: list[int] = []
 
     original_offset = 0
     new_offset = 0
@@ -145,35 +207,82 @@ def build_teacher_forcing_layout(
         if num_frames < 1 or height < 1 or width < 1:
             raise ValueError(f"vision_token_shapes[{sample_id}] must be positive, got {vision_shape}")
 
+        action_count = 0
+        if action_token_counts is not None:
+            action_count = action_token_counts[sample_id]
+            if action_count < 0:
+                raise ValueError(f"action_token_counts[{sample_id}] must be >= 0, got {action_count}")
+
         spatial_tokens = height * width
         vision_count = num_frames * spatial_tokens
-        original_sample_len = und_count + vision_count
-        new_sample_len = und_count + 2 * vision_count
+        gen_len = vision_count + action_count
+        original_sample_len = und_count + gen_len
+        new_sample_len = und_count + 2 * gen_len
 
         und_source = list(range(original_offset, original_offset + und_count))
-        vision_source = list(range(original_offset + und_count, original_offset + original_sample_len))
-        vision_frame_ids = torch.arange(num_frames, dtype=torch.long).repeat_interleave(spatial_tokens)
-        vision_block_ids = torch.div(vision_frame_ids, block_size, rounding_mode="floor").tolist()
+        vision_source_start = original_offset + und_count
+        action_source_start = vision_source_start + vision_count
+
+        num_blocks = (num_frames + block_size - 1) // block_size
+        action_block_of_step: list[int] = []
+        if action_count > 0:
+            assert temporal_compression_factor is not None
+            action_latent_frames = assign_action_steps_to_latent_frames(
+                action_count, num_frames, temporal_compression_factor
+            )
+            action_block_of_step = [latent_frame // block_size for latent_frame in action_latent_frames]
+
+        # Interleave the GEN stream per causal block: vision frames of block b
+        # (in frame order) followed by the action steps of block b (in step
+        # order). With no action this degenerates to the plain frame order.
+        gen_source: list[int] = []
+        gen_block_ids: list[int] = []
+        vision_positions_in_gen: list[int] = []  # frame-major token order
+        action_positions_in_gen: list[int] = []  # step order
+        next_action_step = 0
+        for block_id in range(num_blocks):
+            frame_lo = block_id * block_size
+            frame_hi = min(frame_lo + block_size, num_frames)
+            num_block_vision = (frame_hi - frame_lo) * spatial_tokens
+            vision_positions_in_gen.extend(range(len(gen_source), len(gen_source) + num_block_vision))
+            gen_source.extend(
+                range(vision_source_start + frame_lo * spatial_tokens, vision_source_start + frame_hi * spatial_tokens)
+            )
+            gen_block_ids.extend([block_id] * num_block_vision)
+            while next_action_step < action_count and action_block_of_step[next_action_step] == block_id:
+                action_positions_in_gen.append(len(gen_source))
+                gen_source.append(action_source_start + next_action_step)
+                gen_block_ids.append(block_id)
+                next_action_step += 1
+        if next_action_step != action_count:
+            raise ValueError(
+                f"sample {sample_id}: {action_count - next_action_step} action steps were not assigned to any block"
+            )
 
         clean_start = new_offset + und_count
-        noisy_start = clean_start + vision_count
+        noisy_start = clean_start + gen_len
         new_sample_end = new_offset + new_sample_len
 
         original_sample_lens.append(original_sample_len)
         sample_lens.append(new_sample_len)
-        split_lens.extend((und_count, 2 * vision_count))
+        split_lens.extend((und_count, 2 * gen_len))
         attn_modes.extend(("causal", "full"))
-        source_sequence_indexes.extend(und_source + vision_source + vision_source)
+        source_sequence_indexes.extend(und_source + gen_source + gen_source)
         sample_ids.extend([sample_id] * new_sample_len)
         stream_ids.extend(
             [int(TeacherForcingStream.UND)] * und_count
-            + [int(TeacherForcingStream.CLEAN)] * vision_count
-            + [int(TeacherForcingStream.NOISY)] * vision_count
+            + [int(TeacherForcingStream.CLEAN)] * gen_len
+            + [int(TeacherForcingStream.NOISY)] * gen_len
         )
-        block_ids.extend([-1] * und_count + vision_block_ids + vision_block_ids)
+        block_ids.extend([-1] * und_count + gen_block_ids + gen_block_ids)
         gen_query_indexes.extend(range(clean_start, new_sample_end))
-        clean_token_indexes.extend(range(clean_start, noisy_start))
-        noisy_output_indexes.extend(range(noisy_start, new_sample_end))
+        clean_token_indexes.extend(clean_start + position for position in vision_positions_in_gen)
+        clean_action_token_indexes.extend(clean_start + position for position in action_positions_in_gen)
+        # Noisy outputs stay in the original packed order: vision (frame order)
+        # then action (step order) per sample.
+        noisy_output_indexes.extend(noisy_start + position for position in vision_positions_in_gen)
+        noisy_output_indexes.extend(noisy_start + position for position in action_positions_in_gen)
+        noisy_action_output_indexes.extend(noisy_start + position for position in action_positions_in_gen)
 
         original_offset += original_sample_len
         new_offset = new_sample_end
@@ -192,6 +301,8 @@ def build_teacher_forcing_layout(
         gen_query_indexes=torch.tensor(gen_query_indexes, dtype=torch.long),
         clean_token_indexes=torch.tensor(clean_token_indexes, dtype=torch.long),
         noisy_output_indexes=torch.tensor(noisy_output_indexes, dtype=torch.long),
+        clean_action_token_indexes=torch.tensor(clean_action_token_indexes, dtype=torch.long),
+        noisy_action_output_indexes=torch.tensor(noisy_action_output_indexes, dtype=torch.long),
     )
 
 
@@ -491,21 +602,21 @@ def visualize_dense_teacher_forcing_gen_mask(
 
 def _validate_teacher_forcing_packed_sequence(
     packed_sequence: PackedSequence,
-) -> tuple[list[int], list[tuple[int, int, int]]]:
-    """Validate the currently supported vision-only source packing contract."""
+) -> tuple[list[int], list[tuple[int, int, int]], list[int] | None]:
+    """Validate the supported ``[UND | vision (| action)]`` source packing contract."""
 
     if packed_sequence.teacher_forcing is not None:
         raise ValueError("packed_sequence already contains teacher-forcing data")
     if packed_sequence.vision is None:
         raise ValueError("teacher-forcing expansion requires vision data")
-    if packed_sequence.action is not None:
-        raise ValueError("teacher-forcing expansion does not support action data")
     if packed_sequence.sound is not None:
         raise ValueError("teacher-forcing expansion does not support sound data")
     if packed_sequence.is_image_batch:
         raise ValueError("teacher-forcing expansion requires a video batch")
     if packed_sequence.vision_item_split_lens or packed_sequence.control_weights is not None:
         raise ValueError("teacher-forcing expansion does not support multi-item vision packing")
+    if packed_sequence.num_action_tokens_per_supertoken != 0:
+        raise ValueError("teacher-forcing expansion does not support temporal-causal supertoken packing")
     if packed_sequence.sequence_length != sum(packed_sequence.sample_lens):
         raise ValueError(
             "packed_sequence.sequence_length must equal sum(sample_lens), "
@@ -521,17 +632,25 @@ def _validate_teacher_forcing_packed_sequence(
         )
 
     vision = packed_sequence.vision
+    action = packed_sequence.action
     num_samples = len(packed_sequence.sample_lens)
     if len(vision.token_shapes) != num_samples or len(vision.tokens) != num_samples:
         raise ValueError(
             "teacher-forcing expansion requires exactly one vision item per packed sample, "
             f"got {len(vision.token_shapes)} shapes, {len(vision.tokens)} payloads, and {num_samples} samples"
         )
+    if action is not None and (len(action.token_shapes) != num_samples or len(action.tokens) != num_samples):
+        raise ValueError(
+            "teacher-forcing expansion requires exactly one action item per packed sample, "
+            f"got {len(action.token_shapes)} shapes, {len(action.tokens)} payloads, and {num_samples} samples"
+        )
 
     vision_token_shapes: list[tuple[int, int, int]] = []
     und_token_counts: list[int] = []
+    action_token_counts: list[int] | None = [] if action is not None else None
     expected_text_indexes: list[int] = []
     expected_vision_indexes: list[int] = []
+    expected_action_indexes: list[int] = []
     expected_split_lens: list[int] = []
     expected_attn_modes: list[str] = []
     sample_offset = 0
@@ -540,26 +659,57 @@ def _validate_teacher_forcing_packed_sequence(
             raise ValueError(f"vision.token_shapes[{sample_id}] must contain (T, H, W), got {token_shape}")
         num_frames, height, width = token_shape
         vision_count = num_frames * height * width
-        und_count = sample_len - vision_count
+
+        action_count = 0
+        if action is not None:
+            action_shape = action.token_shapes[sample_id]
+            if len(action_shape) != 1:
+                raise ValueError(f"action.token_shapes[{sample_id}] must contain (T_action,), got {action_shape}")
+            action_count = action_shape[0]
+            if action_count < 1:
+                raise ValueError(f"action.token_shapes[{sample_id}] must contain at least one step, got {action_shape}")
+            assert action_token_counts is not None
+            action_token_counts.append(action_count)
+
+        und_count = sample_len - vision_count - action_count
         if und_count < 1:
             raise ValueError(
-                f"sample {sample_id} must contain at least one UND token before its vision tokens, got {und_count}"
+                f"sample {sample_id} must contain at least one UND token before its GEN tokens, got {und_count}"
             )
-        expected_text_indexes.extend(range(sample_offset, sample_offset + und_count))
-        expected_vision_indexes.extend(range(sample_offset + und_count, sample_offset + sample_len))
-        expected_split_lens.extend((und_count, vision_count))
+        vision_start = sample_offset + und_count
+        action_start = vision_start + vision_count
+        expected_text_indexes.extend(range(sample_offset, vision_start))
+        expected_vision_indexes.extend(range(vision_start, action_start))
+        expected_action_indexes.extend(range(action_start, sample_offset + sample_len))
+        expected_split_lens.extend((und_count, vision_count + action_count))
         expected_attn_modes.extend(("causal", "full"))
         und_token_counts.append(und_count)
         vision_token_shapes.append((num_frames, height, width))
+
+        if action_count > 0:
+            # Enforce action_start_frame_offset == 0: with offset 0 the first
+            # action step shares the temporal mRoPE coordinate of the first
+            # vision latent frame (both integer and FPS-modulated paths).
+            vision_first_temporal = float(packed_sequence.position_ids[0, vision_start])
+            action_first_temporal = float(packed_sequence.position_ids[0, action_start])
+            if vision_first_temporal != action_first_temporal:
+                raise ValueError(
+                    f"sample {sample_id}: teacher-forcing V+A training requires action_start_frame_offset=0 "
+                    f"(first action temporal position {action_first_temporal} must equal first vision latent "
+                    f"frame temporal position {vision_first_temporal})"
+                )
+
         sample_offset += sample_len
 
     if packed_sequence.text_indexes.tolist() != expected_text_indexes:
-        raise ValueError("text and vision sequence indexes must form the expected per-sample UND/GEN partition")
+        raise ValueError("text and GEN sequence indexes must form the expected per-sample UND/GEN partition")
     if vision.sequence_indexes.tolist() != expected_vision_indexes:
-        raise ValueError("text and vision sequence indexes must form the expected per-sample UND/GEN partition")
+        raise ValueError("text and GEN sequence indexes must form the expected per-sample UND/GEN partition")
+    if action is not None and action.sequence_indexes.tolist() != expected_action_indexes:
+        raise ValueError("action sequence indexes must directly follow each sample's vision tokens")
     if packed_sequence.split_lens != expected_split_lens or packed_sequence.attn_modes != expected_attn_modes:
         raise ValueError(
-            "source attention splits must alternate one causal UND split and one full vision split per sample"
+            "source attention splits must alternate one causal UND split and one full GEN split per sample"
         )
     if packed_sequence.text_ids.numel() != len(expected_text_indexes):
         raise ValueError(
@@ -567,7 +717,7 @@ def _validate_teacher_forcing_packed_sequence(
             f"got {packed_sequence.text_ids.numel()} and {len(expected_text_indexes)}"
         )
 
-    return und_token_counts, vision_token_shapes
+    return und_token_counts, vision_token_shapes, action_token_counts
 
 
 def _build_source_to_stream_index(
@@ -590,48 +740,89 @@ def _remap_indexes(indexes: torch.Tensor | None, source_to_new: dict[int, int], 
     return torch.tensor(remapped, dtype=torch.long)
 
 
+def _validate_clean_payloads(
+    name: str,
+    clean_tokens: Sequence[torch.Tensor],
+    noisy_tokens: Sequence[torch.Tensor],
+) -> None:
+    """Require one clean payload per noisy payload with identical shape/dtype/device."""
+
+    if len(clean_tokens) != len(noisy_tokens):
+        raise ValueError(
+            f"clean_{name}_tokens must contain one payload per noisy {name} payload, "
+            f"got {len(clean_tokens)} and {len(noisy_tokens)}"
+        )
+    for payload_id, (clean_token, noisy_token) in enumerate(zip(clean_tokens, noisy_tokens)):
+        if clean_token.shape != noisy_token.shape:
+            raise ValueError(
+                f"clean/noisy {name} payload {payload_id} must have the same shape, "
+                f"got {tuple(clean_token.shape)} and {tuple(noisy_token.shape)}"
+            )
+        if clean_token.dtype != noisy_token.dtype:
+            raise ValueError(
+                f"clean/noisy {name} payload {payload_id} must have the same dtype, "
+                f"got {clean_token.dtype} and {noisy_token.dtype}"
+            )
+        if clean_token.device != noisy_token.device:
+            raise ValueError(
+                f"clean/noisy {name} payload {payload_id} must be on the same device, "
+                f"got {clean_token.device} and {noisy_token.device}"
+            )
+
+
+def _remap_spans(spans, source_to_noisy: dict[int, int], name: str) -> list:
+    """Shift modality spans into the noisy stream, requiring per-span contiguity."""
+
+    remapped_spans = []
+    for span in spans:
+        span_indexes = [
+            source_to_noisy[index] for index in range(span.sequence_start, span.sequence_start + span.sequence_len)
+        ]
+        if span_indexes != list(range(span_indexes[0], span_indexes[0] + span.sequence_len)):
+            raise ValueError(f"{name} span at source index {span.sequence_start} is not contiguous after remapping")
+        remapped_spans.append(replace(span, sequence_start=span_indexes[0]))
+    return remapped_spans
+
+
 def expand_packed_sequence_for_teacher_forcing(
     packed_sequence: PackedSequence,
     *,
     clean_vision_tokens: Sequence[torch.Tensor],
     block_size: int,
     history_blocks: int,
+    clean_action_tokens: Sequence[torch.Tensor] | None = None,
+    temporal_compression_factor: int | None = None,
 ) -> PackedSequence:
-    """Return a vision-only packed sequence expanded into clean/noisy GEN streams."""
+    """Return a packed sequence expanded into clean/noisy GEN streams.
 
-    from cosmos_framework.data.generator.sequence_packing.modality import ModalitySpan
+    Vision-only sequences expand to ``[UND | clean V | noisy V]``. Sequences
+    with action data expand to per-block interleaved dual streams and require
+    ``clean_action_tokens`` plus ``temporal_compression_factor`` for the
+    action-to-latent-frame block assignment.
+    """
 
-    und_token_counts, vision_token_shapes = _validate_teacher_forcing_packed_sequence(packed_sequence)
+    und_token_counts, vision_token_shapes, action_token_counts = _validate_teacher_forcing_packed_sequence(
+        packed_sequence
+    )
     assert packed_sequence.vision is not None
     vision = packed_sequence.vision
+    action = packed_sequence.action
 
-    if len(clean_vision_tokens) != len(vision.tokens):
-        raise ValueError(
-            "clean_vision_tokens must contain one payload per noisy vision payload, "
-            f"got {len(clean_vision_tokens)} and {len(vision.tokens)}"
-        )
-    for payload_id, (clean_token, noisy_token) in enumerate(zip(clean_vision_tokens, vision.tokens)):
-        if clean_token.shape != noisy_token.shape:
-            raise ValueError(
-                f"clean/noisy vision payload {payload_id} must have the same shape, "
-                f"got {tuple(clean_token.shape)} and {tuple(noisy_token.shape)}"
-            )
-        if clean_token.dtype != noisy_token.dtype:
-            raise ValueError(
-                f"clean/noisy vision payload {payload_id} must have the same dtype, "
-                f"got {clean_token.dtype} and {noisy_token.dtype}"
-            )
-        if clean_token.device != noisy_token.device:
-            raise ValueError(
-                f"clean/noisy vision payload {payload_id} must be on the same device, "
-                f"got {clean_token.device} and {noisy_token.device}"
-            )
+    _validate_clean_payloads("vision", clean_vision_tokens, vision.tokens)
+    if action is not None:
+        if clean_action_tokens is None:
+            raise ValueError("clean_action_tokens is required when the packed sequence contains action data")
+        _validate_clean_payloads("action", clean_action_tokens, action.tokens)
+    elif clean_action_tokens is not None:
+        raise ValueError("clean_action_tokens was provided but the packed sequence contains no action data")
 
     layout = build_teacher_forcing_layout(
         und_token_counts=und_token_counts,
         vision_token_shapes=vision_token_shapes,
         block_size=block_size,
         history_blocks=history_blocks,
+        action_token_counts=action_token_counts,
+        temporal_compression_factor=temporal_compression_factor,
     )
     source_to_und = _build_source_to_stream_index(layout, TeacherForcingStream.UND)
     source_to_noisy = _build_source_to_stream_index(layout, TeacherForcingStream.NOISY)
@@ -652,28 +843,42 @@ def expand_packed_sequence_for_teacher_forcing(
     assert remapped_vision_indexes is not None
     assert remapped_mse_loss_indexes is not None
 
-    remapped_spans: list[ModalitySpan] = []
-    for span in vision.spans:
-        span_indexes = [
-            source_to_noisy[index] for index in range(span.sequence_start, span.sequence_start + span.sequence_len)
-        ]
-        if span_indexes != list(range(span_indexes[0], span_indexes[0] + span.sequence_len)):
-            raise ValueError(f"vision span at source index {span.sequence_start} is not contiguous after remapping")
-        remapped_spans.append(replace(span, sequence_start=span_indexes[0]))
-
     expanded_vision = replace(
         vision,
         sequence_indexes=remapped_vision_indexes,
         mse_loss_indexes=remapped_mse_loss_indexes,
-        spans=remapped_spans,
+        spans=_remap_spans(vision.spans, source_to_noisy, "vision"),
         tokens=list(vision.tokens),
         token_shapes=list(vision.token_shapes),
         condition_mask=list(vision.condition_mask),
         noisy_frame_indexes=list(vision.noisy_frame_indexes),
     )
+
+    expanded_action = None
+    if action is not None:
+        remapped_action_indexes = _remap_indexes(action.sequence_indexes, source_to_noisy, "action.sequence_indexes")
+        remapped_action_mse_indexes = _remap_indexes(
+            action.mse_loss_indexes,
+            source_to_noisy,
+            "action.mse_loss_indexes",
+        )
+        assert remapped_action_indexes is not None
+        assert remapped_action_mse_indexes is not None
+        expanded_action = replace(
+            action,
+            sequence_indexes=remapped_action_indexes,
+            mse_loss_indexes=remapped_action_mse_indexes,
+            spans=_remap_spans(action.spans, source_to_noisy, "action"),
+            tokens=list(action.tokens),
+            token_shapes=list(action.token_shapes),
+            condition_mask=list(action.condition_mask),
+            noisy_frame_indexes=list(action.noisy_frame_indexes),
+        )
+
     teacher_forcing = TeacherForcingData(
         layout=layout,
         clean_vision_tokens=list(clean_vision_tokens),
+        clean_action_tokens=list(clean_action_tokens) if clean_action_tokens is not None else None,
     )
     return replace(
         packed_sequence,
@@ -686,6 +891,7 @@ def expand_packed_sequence_for_teacher_forcing(
         position_ids=packed_sequence.position_ids[:, layout.source_sequence_indexes],
         ce_loss_indexes=remapped_ce_loss_indexes,
         vision=expanded_vision,
+        action=expanded_action,
         teacher_forcing=teacher_forcing,
     )
 

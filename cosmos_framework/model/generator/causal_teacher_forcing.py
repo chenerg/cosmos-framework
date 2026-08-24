@@ -43,8 +43,6 @@ def validate_teacher_forcing_config(config: TeacherForcingConfig) -> None:
         )
     if not config.vision_gen:
         raise ValueError("OmniMoTCausalModel requires vision_gen=True")
-    if config.action_gen:
-        raise ValueError("OmniMoTCausalModel teacher forcing does not support action_gen=True")
     if config.sound_gen:
         raise ValueError("OmniMoTCausalModel teacher forcing does not support sound_gen=True")
     if config.video_temporal_causal:
@@ -81,9 +79,11 @@ def expand_teacher_forcing_training_sequence(
     *,
     clean_vision_tokens: list[torch.Tensor],
     config: TeacherForcingConfig,
+    clean_action_tokens: list[torch.Tensor] | None = None,
+    temporal_compression_factor: int | None = None,
     generator: torch.Generator | None = None,
 ) -> PackedSequence:
-    """Sample batch-shared S/K and expand an already-noised video sequence."""
+    """Sample batch-shared S/K and expand an already-noised video(+action) sequence."""
 
     validate_teacher_forcing_config(config)
     if packed_sequence.is_image_batch:
@@ -101,4 +101,6 @@ def expand_teacher_forcing_training_sequence(
         clean_vision_tokens=clean_vision_tokens,
         block_size=block_size,
         history_blocks=history_blocks,
+        clean_action_tokens=clean_action_tokens,
+        temporal_compression_factor=temporal_compression_factor,
     )

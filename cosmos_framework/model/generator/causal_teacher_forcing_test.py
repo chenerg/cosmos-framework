@@ -57,12 +57,49 @@ def _packed_noisy_video() -> PackedSequence:
     )
 
 
+def _packed_noisy_video_action() -> PackedSequence:
+    """One sample: [UND(1) | vision T=3 (1x1) | action A=5], offset-0 alignment."""
+
+    noisy_vision = torch.tensor([[[[[10.0]], [[20.0]], [[30.0]]]]])
+    noisy_action = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    position_ids = torch.zeros(3, 9, dtype=torch.long)
+    # Temporal axis: vision latent frames [1,2,3]; action steps share the vision
+    # start coordinate (action_start_frame_offset=0).
+    position_ids[0] = torch.tensor([0, 1, 2, 3, 1, 2, 3, 4, 5])
+    return PackedSequence(
+        sample_lens=[9],
+        split_lens=[1, 8],
+        attn_modes=["causal", "full"],
+        sequence_length=9,
+        text_ids=torch.tensor([101]),
+        text_indexes=torch.tensor([0]),
+        position_ids=position_ids,
+        vision=ModalityData(
+            sequence_indexes=torch.tensor([1, 2, 3]),
+            timesteps=torch.tensor([0.5, 0.5, 0.5]),
+            mse_loss_indexes=torch.tensor([1, 2, 3]),
+            token_shapes=[(3, 1, 1)],
+            tokens=[noisy_vision],
+            condition_mask=[torch.zeros(3, 1, 1)],
+            noisy_frame_indexes=[torch.tensor([0, 1, 2])],
+        ),
+        action=ModalityData(
+            sequence_indexes=torch.tensor([4, 5, 6, 7, 8]),
+            timesteps=torch.tensor([0.5] * 5),
+            mse_loss_indexes=torch.tensor([4, 5, 6, 7, 8]),
+            token_shapes=[(5,)],
+            tokens=[noisy_action],
+            condition_mask=[torch.zeros(5, 1)],
+            noisy_frame_indexes=[torch.tensor([0, 1, 2, 3, 4])],
+        ),
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "error"),
     [
         ({"causal_training_strategy": "none"}, "teacher_forcing"),
         ({"vision_gen": False}, "vision_gen"),
-        ({"action_gen": True}, "action_gen"),
         ({"sound_gen": True}, "sound_gen"),
         ({"video_temporal_causal": True}, "video_temporal_causal"),
         ({"teacher_forcing_block_size_min": 0}, "block_size"),
@@ -109,6 +146,100 @@ def test_expand_teacher_forcing_training_sequence_rejects_images():
             clean_vision_tokens=[torch.zeros(1, 1, 3, 1, 1)],
             config=_config(),
         )
+
+
+def test_expand_teacher_forcing_training_sequence_supports_vision_action():
+    packed = _packed_noisy_video_action()
+    clean_vision = [torch.tensor([[[[[1.0]], [[2.0]], [[3.0]]]]])]
+    clean_action = [torch.zeros(5, 2)]
+
+    expanded = expand_teacher_forcing_training_sequence(
+        packed,
+        clean_vision_tokens=clean_vision,
+        config=_config(action_gen=True),
+        clean_action_tokens=clean_action,
+        temporal_compression_factor=2,
+    )
+
+    assert expanded.teacher_forcing is not None
+    layout = expanded.teacher_forcing.layout
+    # S=2: vision frame blocks [0,0,1]; action latent frames ceil(j/2)=[0,1,1,2,2]
+    # give action blocks [0,0,0,1,1]. Interleaved GEN order per stream:
+    # [V0 V1 A0 A1 A2 | V2 A3 A4].
+    assert layout.block_ids.tolist() == [-1] + [0, 0, 0, 0, 0, 1, 1, 1] * 2
+    assert layout.source_sequence_indexes.tolist() == [0] + [1, 2, 4, 5, 6, 3, 7, 8] * 2
+    assert layout.clean_token_indexes.tolist() == [1, 2, 6]
+    assert layout.clean_action_token_indexes.tolist() == [3, 4, 5, 7, 8]
+    assert layout.noisy_output_indexes.tolist() == [9, 10, 14, 11, 12, 13, 15, 16]
+    assert layout.noisy_action_output_indexes.tolist() == [11, 12, 13, 15, 16]
+    assert expanded.vision is not None and expanded.action is not None
+    assert expanded.vision.sequence_indexes.tolist() == [9, 10, 14]
+    assert expanded.action.sequence_indexes.tolist() == [11, 12, 13, 15, 16]
+    assert expanded.action.mse_loss_indexes.tolist() == [11, 12, 13, 15, 16]
+    assert expanded.teacher_forcing.clean_action_tokens == clean_action
+    assert torch.equal(
+        expanded.position_ids[:, layout.clean_action_token_indexes],
+        expanded.position_ids[:, layout.noisy_action_output_indexes],
+    )
+
+
+def test_expand_teacher_forcing_training_sequence_rejects_nonzero_action_offset():
+    packed = _packed_noisy_video_action()
+    packed.position_ids[0, 4] = 2  # first action step no longer aligned with vision frame 0
+
+    with pytest.raises(ValueError, match="action_start_frame_offset"):
+        expand_teacher_forcing_training_sequence(
+            packed,
+            clean_vision_tokens=[torch.zeros(1, 1, 3, 1, 1)],
+            config=_config(action_gen=True),
+            clean_action_tokens=[torch.zeros(5, 2)],
+            temporal_compression_factor=2,
+        )
+
+
+def test_post_noise_packing_hook_supports_action_payloads():
+    packed = _packed_noisy_video_action()
+    assert packed.vision is not None and packed.action is not None
+    packed.vision.tokens = [token.to(torch.bfloat16) for token in packed.vision.tokens]
+    packed.action.tokens = [token.to(torch.bfloat16) for token in packed.action.tokens]
+    clean_x0_vision = torch.tensor([[[[[1.0]], [[2.0]], [[3.0]]]]], dtype=torch.float32)
+    clean_x0_action = torch.zeros(5, 2, dtype=torch.float32)
+    gen_data_clean = GenerationDataClean(
+        batch_size=1,
+        is_image_batch=False,
+        x0_tokens_vision=[clean_x0_vision],
+        x0_tokens_action=[clean_x0_action],
+    )
+    model = SimpleNamespace(
+        config=_config(action_gen=True),
+        precision=torch.bfloat16,
+        tokenizer_vision_gen=SimpleNamespace(temporal_compression_factor=2),
+    )
+
+    expanded = OmniMoTCausalModel.post_noise_packing_hook(model, packed, gen_data_clean)
+
+    assert expanded.teacher_forcing is not None
+    assert expanded.teacher_forcing.clean_action_tokens is not None
+    assert expanded.teacher_forcing.clean_action_tokens[0].dtype == torch.bfloat16
+    assert gen_data_clean.x0_tokens_action[0] is clean_x0_action
+    assert gen_data_clean.x0_tokens_action[0].dtype == torch.float32
+
+
+def test_post_noise_packing_hook_requires_clean_action_tokens():
+    packed = _packed_noisy_video_action()
+    gen_data_clean = GenerationDataClean(
+        batch_size=1,
+        is_image_batch=False,
+        x0_tokens_vision=[torch.zeros(1, 1, 3, 1, 1)],
+    )
+    model = SimpleNamespace(
+        config=_config(action_gen=True),
+        precision=torch.bfloat16,
+        tokenizer_vision_gen=SimpleNamespace(temporal_compression_factor=2),
+    )
+
+    with pytest.raises(ValueError, match="clean action tokens"):
+        OmniMoTCausalModel.post_noise_packing_hook(model, packed, gen_data_clean)
 
 
 def test_post_noise_packing_hook_casts_clean_model_input_without_mutating_fp32_x0():

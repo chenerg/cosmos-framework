@@ -12,6 +12,7 @@ from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     TeacherForcingData,
     TeacherForcingLayout,
     TeacherForcingStream,
+    assign_action_steps_to_latent_frames,
     build_dense_teacher_forcing_gen_mask,
     build_teacher_forcing_layout,
     expand_packed_sequence_for_teacher_forcing,
@@ -516,6 +517,91 @@ def test_expand_packed_sequence_rejects_clean_payload_dtype_mismatch():
         )
 
 
+def test_assign_action_steps_to_latent_frames_uses_offset_zero_ceiling():
+    assert assign_action_steps_to_latent_frames(5, 3, 2) == [0, 1, 1, 2, 2]
+    # LIBERO-like: 16 action steps, 5 latent frames, cf=4.
+    assert assign_action_steps_to_latent_frames(16, 5, 4) == [0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4]
+    assert assign_action_steps_to_latent_frames(0, 3, 2) == []
+
+
+def test_assign_action_steps_to_latent_frames_rejects_invalid_inputs():
+    with pytest.raises(ValueError, match="beyond the video"):
+        assign_action_steps_to_latent_frames(7, 3, 2)
+    with pytest.raises(ValueError, match="temporal_compression_factor"):
+        assign_action_steps_to_latent_frames(3, 3, 0)
+
+
+def test_build_teacher_forcing_layout_interleaves_action_per_block():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(3, 1, 1)],
+        block_size=2,
+        history_blocks=1,
+        action_token_counts=[5],
+        temporal_compression_factor=2,
+    )
+
+    # Vision frame blocks [0,0,1]; action latent frames [0,1,1,2,2] -> blocks
+    # [0,0,0,1,1]. Interleaved GEN order: [V0 V1 A0 A1 A2 | V2 A3 A4].
+    assert layout.original_sample_lens == (9,)
+    assert layout.sample_lens == (17,)
+    assert layout.split_lens == (1, 16)
+    assert layout.source_sequence_indexes.tolist() == [0] + [1, 2, 4, 5, 6, 3, 7, 8] * 2
+    assert layout.stream_ids.tolist() == [-1] + [0] * 8 + [1] * 8
+    assert layout.block_ids.tolist() == [-1] + [0, 0, 0, 0, 0, 1, 1, 1] * 2
+    assert layout.gen_query_indexes.tolist() == list(range(1, 17))
+    assert layout.clean_token_indexes.tolist() == [1, 2, 6]
+    assert layout.clean_action_token_indexes.tolist() == [3, 4, 5, 7, 8]
+    assert layout.noisy_output_indexes.tolist() == [9, 10, 14, 11, 12, 13, 15, 16]
+    assert layout.noisy_action_output_indexes.tolist() == [11, 12, 13, 15, 16]
+
+
+def test_build_teacher_forcing_layout_without_action_keeps_empty_action_fields():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[2],
+        vision_token_shapes=[(5, 1, 1)],
+        block_size=2,
+        history_blocks=1,
+    )
+
+    assert layout.clean_action_token_indexes.numel() == 0
+    assert layout.noisy_action_output_indexes.numel() == 0
+
+
+def test_build_teacher_forcing_layout_rejects_action_without_compression_factor():
+    with pytest.raises(ValueError, match="temporal_compression_factor"):
+        build_teacher_forcing_layout(
+            und_token_counts=[1],
+            vision_token_shapes=[(3, 1, 1)],
+            block_size=1,
+            history_blocks=1,
+            action_token_counts=[3],
+        )
+
+
+def test_dense_mask_applies_block_rules_across_vision_and_action():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(3, 1, 1)],
+        block_size=1,
+        history_blocks=1,
+        action_token_counts=[5],
+        temporal_compression_factor=2,
+    )
+    mask = build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=layout.source_sequence_indexes.numel())
+
+    # GEN order per stream: [V0 A0 | V1 A1 A2 | V2 A3 A4] with blocks [0,0,1,1,1,2,2,2].
+    # Columns: 0=UND, clean 1..8, noisy 9..16. Rows follow gen_query_indexes (position-1).
+    noisy_a1_row = 11  # noisy A1 at position 12, block 1
+    assert mask[noisy_a1_row].nonzero(as_tuple=True)[0].tolist() == [0, 1, 2, 11, 12, 13]
+    clean_a1_row = 3  # clean A1 at position 4, block 1
+    assert mask[clean_a1_row].nonzero(as_tuple=True)[0].tolist() == [0, 1, 2, 3, 4, 5]
+    noisy_v0_row = 8  # noisy V0 at position 9, block 0: no clean history at all
+    assert mask[noisy_v0_row].nonzero(as_tuple=True)[0].tolist() == [0, 9, 10]
+    clean_v2_row = 5  # clean V2 at position 6, block 2, K=1 window = blocks {1,2}
+    assert mask[clean_v2_row].nonzero(as_tuple=True)[0].tolist() == [0, 3, 4, 5, 6, 7, 8]
+
+
 def test_select_teacher_forcing_noisy_outputs_preserves_order_and_gradient():
     packed = _make_packed_video_sequence()
     clean_tokens = [torch.zeros_like(token) for token in packed.vision.tokens]
@@ -538,3 +624,185 @@ def test_select_teacher_forcing_noisy_outputs_preserves_order_and_gradient():
     selected[expanded.teacher_forcing.layout.noisy_output_indexes] = True
     assert torch.equal(output.grad[selected], torch.ones_like(output.grad[selected]))
     assert torch.equal(output.grad[~selected], torch.zeros_like(output.grad[~selected]))
+
+
+def _make_packed_video_action_sequence() -> PackedSequence:
+    """Two packed samples, each ``[UND | vision | action]`` with offset-0 alignment.
+
+    Sample 0: UND=2, vision T=3 (1x1), action A=5 (cf=2 -> latent frames [0,1,1,2,2]).
+    Sample 1: UND=1, vision T=2 (1x2), action A=3 (cf=2 -> latent frames [0,1,1]).
+    """
+
+    noisy_vision_0 = torch.tensor([[[[[10.0]], [[11.0]], [[12.0]]]]])
+    noisy_vision_1 = torch.tensor([[[[[20.0, 21.0]], [[22.0, 23.0]]]]])
+    noisy_action_0 = torch.arange(10, dtype=torch.float32).reshape(5, 2)
+    noisy_action_1 = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    vision = ModalityData(
+        sequence_indexes=torch.tensor([2, 3, 4, 11, 12, 13, 14]),
+        timesteps=torch.tensor([0.4, 0.4, 0.7, 0.7, 0.7, 0.7]),
+        mse_loss_indexes=torch.tensor([3, 4, 11, 12, 13, 14]),
+        spans=[
+            ModalitySpan(2, 1, 0, 0, 1, (1, 1, 1)),
+            ModalitySpan(3, 1, 0, 1, 1, (1, 1, 1)),
+            ModalitySpan(4, 1, 0, 2, 1, (1, 1, 1)),
+            ModalitySpan(11, 2, 1, 0, 2, (1, 1, 2)),
+            ModalitySpan(13, 2, 1, 2, 2, (1, 1, 2)),
+        ],
+        token_shapes=[(3, 1, 1), (2, 1, 2)],
+        tokens=[noisy_vision_0, noisy_vision_1],
+        condition_mask=[torch.tensor([[[1.0]], [[0.0]], [[0.0]]]), torch.zeros(2, 1, 1)],
+        noisy_frame_indexes=[torch.tensor([1, 2]), torch.tensor([0, 1])],
+    )
+    action = ModalityData(
+        sequence_indexes=torch.tensor([5, 6, 7, 8, 9, 15, 16, 17]),
+        timesteps=torch.tensor([0.4, 0.4, 0.4, 0.4, 0.7, 0.7, 0.7]),
+        mse_loss_indexes=torch.tensor([6, 7, 8, 9, 15, 16, 17]),
+        spans=[
+            ModalitySpan(5, 1, 0, 0, 1, (1,)),
+            ModalitySpan(6, 1, 0, 1, 1, (1,)),
+            ModalitySpan(7, 1, 0, 2, 1, (1,)),
+            ModalitySpan(8, 1, 0, 3, 1, (1,)),
+            ModalitySpan(9, 1, 0, 4, 1, (1,)),
+            ModalitySpan(15, 1, 1, 0, 1, (1,)),
+            ModalitySpan(16, 1, 1, 1, 1, (1,)),
+            ModalitySpan(17, 1, 1, 2, 1, (1,)),
+        ],
+        token_shapes=[(5,), (3,)],
+        tokens=[noisy_action_0, noisy_action_1],
+        condition_mask=[torch.tensor([[1.0], [0.0], [0.0], [0.0], [0.0]]), torch.zeros(3, 1)],
+        noisy_frame_indexes=[torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2])],
+    )
+    position_ids = torch.zeros(3, 18, dtype=torch.long)
+    # Temporal axis: per sample the first action step shares the first vision
+    # latent frame's coordinate (action_start_frame_offset=0).
+    position_ids[0] = torch.tensor([5, 6, 7, 8, 9, 7, 8, 9, 10, 11, 0, 3, 3, 4, 4, 3, 4, 5])
+    return PackedSequence(
+        sample_lens=[10, 8],
+        split_lens=[2, 8, 1, 7],
+        attn_modes=["causal", "full", "causal", "full"],
+        is_image_batch=False,
+        uses_single_timestep=True,
+        sequence_length=18,
+        text_ids=torch.tensor([101, 102, 103]),
+        text_indexes=torch.tensor([0, 1, 10]),
+        position_ids=position_ids,
+        vision=vision,
+        action=action,
+    )
+
+
+def test_expand_packed_sequence_interleaves_vision_and_action_per_block():
+    packed = _make_packed_video_action_sequence()
+    clean_vision = [torch.full_like(token, -1.0) for token in packed.vision.tokens]
+    clean_action = [torch.full_like(token, -2.0) for token in packed.action.tokens]
+
+    expanded = expand_packed_sequence_for_teacher_forcing(
+        packed,
+        clean_vision_tokens=clean_vision,
+        block_size=2,
+        history_blocks=1,
+        clean_action_tokens=clean_action,
+        temporal_compression_factor=2,
+    )
+
+    assert expanded.teacher_forcing is not None
+    layout = expanded.teacher_forcing.layout
+    # Sample 0 (S=2): vision blocks [0,0,1]; action blocks [0,0,0,1,1].
+    # GEN order: [V0 V1 A0 A1 A2 | V2 A3 A4] -> sources [2,3,5,6,7,4,8,9].
+    # Sample 1: single block -> sources [11,12,13,14,15,16,17].
+    assert layout.original_sample_lens == (10, 8)
+    assert layout.sample_lens == (18, 15)
+    assert layout.split_lens == (2, 16, 1, 14)
+    expected_gen_source_0 = [2, 3, 5, 6, 7, 4, 8, 9]
+    expected_gen_source_1 = [11, 12, 13, 14, 15, 16, 17]
+    assert layout.source_sequence_indexes.tolist() == (
+        [0, 1] + expected_gen_source_0 * 2 + [10] + expected_gen_source_1 * 2
+    )
+    assert layout.clean_token_indexes.tolist() == [2, 3, 7, 19, 20, 21, 22]
+    assert layout.clean_action_token_indexes.tolist() == [4, 5, 6, 8, 9, 23, 24, 25]
+    # Per sample: vision (frame order) then action (step order).
+    assert layout.noisy_output_indexes.tolist() == [10, 11, 15, 12, 13, 14, 16, 17] + [26, 27, 28, 29, 30, 31, 32]
+    assert layout.noisy_action_output_indexes.tolist() == [12, 13, 14, 16, 17, 30, 31, 32]
+
+    assert expanded.text_indexes.tolist() == [0, 1, 18]
+    assert expanded.vision.sequence_indexes.tolist() == [10, 11, 15, 26, 27, 28, 29]
+    assert expanded.vision.mse_loss_indexes.tolist() == [11, 15, 26, 27, 28, 29]
+    assert expanded.action is not None
+    assert expanded.action.sequence_indexes.tolist() == [12, 13, 14, 16, 17, 30, 31, 32]
+    assert expanded.action.mse_loss_indexes.tolist() == [13, 14, 16, 17, 30, 31, 32]
+    assert [span.sequence_start for span in expanded.vision.spans] == [10, 11, 15, 26, 28]
+    assert [span.sequence_start for span in expanded.action.spans] == [12, 13, 14, 16, 17, 30, 31, 32]
+    assert expanded.action.tokens == packed.action.tokens
+    assert expanded.action.condition_mask == packed.action.condition_mask
+    assert expanded.teacher_forcing.clean_action_tokens == clean_action
+
+    # Clean/noisy slots of each modality share mRoPE positions.
+    assert torch.equal(
+        expanded.position_ids[:, layout.clean_token_indexes],
+        expanded.position_ids[:, torch.tensor([10, 11, 15, 26, 27, 28, 29])],
+    )
+    assert torch.equal(
+        expanded.position_ids[:, layout.clean_action_token_indexes],
+        expanded.position_ids[:, layout.noisy_action_output_indexes],
+    )
+
+    # Cross-sample isolation still holds on the interleaved layout.
+    mask = build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=layout.source_sequence_indexes.numel())
+    query_sample_ids = layout.sample_ids[layout.gen_query_indexes]
+    assert not mask[query_sample_ids == 0][:, layout.sample_ids == 1].any()
+    assert not mask[query_sample_ids == 1][:, layout.sample_ids == 0].any()
+
+
+def test_expand_packed_sequence_rejects_nonzero_action_start_frame_offset():
+    packed = _make_packed_video_action_sequence()
+    packed.position_ids[0, 5] = 8  # sample 0's first action step drifts off vision frame 0
+
+    with pytest.raises(ValueError, match="action_start_frame_offset"):
+        expand_packed_sequence_for_teacher_forcing(
+            packed,
+            clean_vision_tokens=[torch.zeros_like(token) for token in packed.vision.tokens],
+            block_size=1,
+            history_blocks=1,
+            clean_action_tokens=[torch.zeros_like(token) for token in packed.action.tokens],
+            temporal_compression_factor=2,
+        )
+
+
+def test_expand_packed_sequence_requires_clean_action_tokens_with_action_data():
+    packed = _make_packed_video_action_sequence()
+
+    with pytest.raises(ValueError, match="clean_action_tokens is required"):
+        expand_packed_sequence_for_teacher_forcing(
+            packed,
+            clean_vision_tokens=[torch.zeros_like(token) for token in packed.vision.tokens],
+            block_size=1,
+            history_blocks=1,
+            temporal_compression_factor=2,
+        )
+
+
+def test_expand_packed_sequence_rejects_clean_action_tokens_without_action_data():
+    packed = _make_packed_video_sequence()
+
+    with pytest.raises(ValueError, match="no action data"):
+        expand_packed_sequence_for_teacher_forcing(
+            packed,
+            clean_vision_tokens=[torch.zeros_like(token) for token in packed.vision.tokens],
+            block_size=1,
+            history_blocks=1,
+            clean_action_tokens=[torch.zeros(2, 2)],
+        )
+
+
+def test_expand_packed_sequence_rejects_action_steps_beyond_video():
+    packed = _make_packed_video_action_sequence()
+
+    with pytest.raises(ValueError, match="beyond the video"):
+        expand_packed_sequence_for_teacher_forcing(
+            packed,
+            clean_vision_tokens=[torch.zeros_like(token) for token in packed.vision.tokens],
+            block_size=1,
+            history_blocks=1,
+            clean_action_tokens=[torch.zeros_like(token) for token in packed.action.tokens],
+            temporal_compression_factor=1,  # A=5 steps then map to latent frames 0..4 > T-1=2
+        )

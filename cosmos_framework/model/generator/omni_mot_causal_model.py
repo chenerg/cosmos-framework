@@ -14,7 +14,7 @@ from cosmos_framework.model.generator.utils.data_and_condition import Generation
 
 
 class OmniMoTCausalModel(OmniMoTModel):
-    """Vision-only causal model using clean/noisy streams in one forward."""
+    """Vision (+ optional action) causal model using clean/noisy streams in one forward."""
 
     def __init__(self, config: OmniMoTModelConfig):
         validate_teacher_forcing_config(config)
@@ -30,8 +30,25 @@ class OmniMoTCausalModel(OmniMoTModel):
         if gen_data_clean.x0_tokens_vision is None:
             raise ValueError("teacher-forcing causal training requires clean vision tokens")
         clean_vision_tokens = [token.to(dtype=self.precision) for token in gen_data_clean.x0_tokens_vision]
+
+        clean_action_tokens = None
+        temporal_compression_factor = None
+        if packed_sequence.action is not None:
+            if gen_data_clean.x0_tokens_action is None:
+                raise ValueError("teacher-forcing causal training requires clean action tokens when action is packed")
+            # Match each clean payload's dtype to its noisy counterpart so the
+            # expansion's clean/noisy payload checks hold.
+            clean_action_tokens = [
+                token.to(dtype=noisy_token.dtype)
+                for token, noisy_token in zip(gen_data_clean.x0_tokens_action, packed_sequence.action.tokens)
+            ]
+            assert self.tokenizer_vision_gen is not None
+            temporal_compression_factor = self.tokenizer_vision_gen.temporal_compression_factor
+
         return expand_teacher_forcing_training_sequence(
             packed_sequence,
             clean_vision_tokens=clean_vision_tokens,
             config=self.config,
+            clean_action_tokens=clean_action_tokens,
+            temporal_compression_factor=temporal_compression_factor,
         )

@@ -764,6 +764,32 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             1, -1
         )  # [B_action*T_action,hidden_size]
 
+        if packed_seq.teacher_forcing is not None and packed_seq.teacher_forcing.clean_action_tokens is not None:
+            # Teacher-forcing clean action stream: same encode path as the noisy
+            # stream but with timestep fixed to 0, scattered to the clean slots.
+            teacher_forcing = packed_seq.teacher_forcing
+            packed_clean_action, clean_per_token_domain_id = self.pack_action(
+                teacher_forcing.clean_action_tokens, action.token_shapes, action.domain_id
+            )
+            packed_clean_action = self.action2llm(packed_clean_action, clean_per_token_domain_id)
+            packed_clean_action = packed_clean_action + self.action_modality_embed.view(1, -1)
+            clean_action_timesteps = torch.zeros(
+                packed_clean_action.shape[0],
+                device=packed_clean_action.device,
+                dtype=torch.float32,
+            )
+            packed_clean_action_timestep_embeds = self._embed_packed_timesteps(clean_action_timesteps, packed_seq).to(
+                target_dtype
+            )
+            packed_clean_action = packed_clean_action + packed_clean_action_timestep_embeds
+            clean_action_indexes = teacher_forcing.layout.clean_action_token_indexes
+            if clean_action_indexes.numel() != packed_clean_action.shape[0]:
+                raise ValueError(
+                    "teacher-forcing clean action indexes must match packed clean action tokens, "
+                    f"got {clean_action_indexes.numel()} and {packed_clean_action.shape[0]}"
+                )
+            packed_sequence[clean_action_indexes] = packed_clean_action
+
         has_noisy_actions = has_noisy_tokens(action)
         if has_noisy_actions:
             timesteps_action = action.timesteps * self.timestep_scale  # [N_noisy_frames_action]
@@ -1000,12 +1026,19 @@ class Cosmos3VFMNetwork(PreTrainedModel):
         # LOSS computation, not from routing.
         all_gen_indexes = []
         if packed_seq.teacher_forcing is not None:
+            # gen_query_indexes already covers the clean and noisy streams of
+            # every GEN modality (vision and action), so the per-modality
+            # appends below must be skipped to avoid duplicate routing indexes.
             all_gen_indexes.append(packed_seq.teacher_forcing.layout.gen_query_indexes)
         elif packed_seq.vision is not None:
             assert packed_seq.vision.token_shapes is not None
             assert isinstance(packed_seq.vision.sequence_indexes, torch.Tensor)
             all_gen_indexes.append(packed_seq.vision.sequence_indexes)
-        if packed_seq.action is not None and isinstance(packed_seq.action.sequence_indexes, torch.Tensor):
+        if (
+            packed_seq.teacher_forcing is None
+            and packed_seq.action is not None
+            and isinstance(packed_seq.action.sequence_indexes, torch.Tensor)
+        ):
             all_gen_indexes.append(packed_seq.action.sequence_indexes)
         if packed_seq.sound is not None and isinstance(packed_seq.sound.sequence_indexes, torch.Tensor):
             all_gen_indexes.append(packed_seq.sound.sequence_indexes)

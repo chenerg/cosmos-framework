@@ -19,9 +19,10 @@ from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
-from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.robotwin_lerobot_dataset import RoboTwinLeRobotDataset
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 
 
@@ -203,6 +204,68 @@ def get_action_droid_merged_lerobot_sft_dataset(
         append_resolution_info=append_resolution_info,
         append_idle_frames=append_idle_frames,
         idle_frames_dropout=idle_frames_dropout,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_robotwin_sft_dataset(
+    *,
+    root: str,
+    fps: float = 30.0,
+    chunk_length: int = 16,
+    action_space: str = "joint_pos",
+    mode: str = "policy",
+    use_state: bool = True,
+    action_normalization: str | None = None,
+    viewpoint: str = "concat_view",
+    use_image_augmentation: bool = False,
+    split: str = "train",
+    split_val_ratio: float = 0.03,
+    split_seed: int = 42,
+    resolution: str | int | None = None,
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = False,
+    format_prompt_as_json: bool = False,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+) -> Dataset:
+    """Build the RoboTwin action SFT dataset: dual-arm ALOHA ``joint_pos`` (14D)
+    + optional ``use_state`` (raw/un-normalized), DROID-style concat_view
+    (cam_high top, two wrist cameras bottom).
+
+    ``root`` is a single RoboTwin-LeRobot-v3.0 task dataset dir (containing
+    ``meta/info.json``), e.g. ``.../RoboTwin-LeRobot-v3.0/adjust_bottle/aloha-agilex_clean_50``."""
+    dataset: Dataset = RoboTwinLeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        split_seed=split_seed,
+        split_val_ratio=split_val_ratio,
+        split=split,
+        mode=mode,
+        action_space=action_space,
+        use_state=use_state,
+        action_normalization=action_normalization,
+        viewpoint=viewpoint,
+        use_image_augmentation=use_image_augmentation,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
         format_prompt_as_json=format_prompt_as_json,
     )
     sft = ActionSFTDataset(dataset, transform, resolution)

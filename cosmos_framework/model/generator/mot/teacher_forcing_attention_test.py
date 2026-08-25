@@ -289,6 +289,34 @@ def test_visualize_dense_teacher_forcing_gen_mask_saves_png(tmp_path):
         assert _pixel(8, 8) == (245, 166, 35)
 
 
+def test_visualize_dense_teacher_forcing_gen_mask_distinguishes_action_tokens(tmp_path):
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(2, 1, 1)],
+        block_size=1,
+        history_blocks=2,
+        action_token_counts=[2],
+        temporal_compression_factor=1,
+    )
+    dense_mask = build_dense_teacher_forcing_gen_mask(
+        layout,
+        max_sequence_length=layout.source_sequence_indexes.numel(),
+    )
+
+    output_path = visualize_dense_teacher_forcing_gen_mask(dense_mask, layout, tmp_path / "mask.png")
+
+    from PIL import Image
+
+    with Image.open(output_path) as image:
+        colors = {color for _, color in image.getcolors(maxcolors=1 << 24)}
+
+    # Vision and action columns must use distinct hues per stream.
+    assert (68, 190, 120) in colors  # CLEAN vision
+    assert (0, 137, 132) in colors  # CLEAN action
+    assert (79, 145, 245) in colors  # NOISY vision
+    assert (186, 104, 240) in colors  # NOISY action
+
+
 def test_dispatch_teacher_forcing_attention_matches_unified_dense_gen_attention():
     layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs()
 

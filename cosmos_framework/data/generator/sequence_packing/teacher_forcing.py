@@ -421,8 +421,12 @@ def visualize_dense_teacher_forcing_gen_mask(
     UND tokens are grouped into blocks of ``und_block_size`` for a compact
     causal lower-triangular overview. CLEAN/NOISY tokens are grouped by their
     causal blocks because all tokens in such a block have identical
-    teacher-forcing visibility. The GEN rows come from ``dense_gen_mask``;
-    the UND rows summarize the separate causal self-attention call.
+    teacher-forcing visibility; within a block, vision and action tokens are
+    kept as separate groups (modality recovered from
+    ``clean_action_token_indexes`` / ``noisy_action_output_indexes``) so both
+    modalities stay visible in the plot. The GEN rows come from
+    ``dense_gen_mask``; the UND rows summarize the separate causal
+    self-attention call.
     """
 
     if und_block_size < 1:
@@ -433,13 +437,26 @@ def visualize_dense_teacher_forcing_gen_mask(
     if tuple(dense_gen_mask.shape) != expected_shape:
         raise ValueError(f"dense_gen_mask shape must be {expected_shape}, got {tuple(dense_gen_mask.shape)}")
 
-    def _group_starts(sample_ids: torch.Tensor, stream_ids: torch.Tensor, block_ids: torch.Tensor) -> torch.Tensor:
+    # Recover per-token modality (0 = UND/vision, 1 = action) from the action
+    # scatter indexes so action tokens interleaved in a causal block do not
+    # collapse into the block's vision group.
+    modality_ids = torch.zeros_like(layout.stream_ids)
+    modality_ids[layout.clean_action_token_indexes] = 1
+    modality_ids[layout.noisy_action_output_indexes] = 1
+
+    def _group_starts(
+        sample_ids: torch.Tensor,
+        stream_ids: torch.Tensor,
+        block_ids: torch.Tensor,
+        modality_ids: torch.Tensor,
+    ) -> torch.Tensor:
         starts = torch.ones(sample_ids.numel(), dtype=torch.bool, device=sample_ids.device)
         if sample_ids.numel() > 1:
             starts[1:] = (
                 (sample_ids[1:] != sample_ids[:-1])
                 | (stream_ids[1:] != stream_ids[:-1])
                 | (block_ids[1:] != block_ids[:-1])
+                | (modality_ids[1:] != modality_ids[:-1])
             )
         sample_offset = 0
         for sample_len, und_count in zip(layout.sample_lens, layout.split_lens[::2]):
@@ -449,10 +466,11 @@ def visualize_dense_teacher_forcing_gen_mask(
         return torch.nonzero(starts, as_tuple=True)[0]
 
     gen_indexes = layout.gen_query_indexes
-    representatives = _group_starts(layout.sample_ids, layout.stream_ids, layout.block_ids)
+    representatives = _group_starts(layout.sample_ids, layout.stream_ids, layout.block_ids, modality_ids)
     representative_sample_ids = layout.sample_ids.index_select(0, representatives)
     representative_stream_ids = layout.stream_ids.index_select(0, representatives)
     representative_block_ids = layout.block_ids.index_select(0, representatives)
+    representative_modality_ids = modality_ids.index_select(0, representatives)
 
     num_groups = representatives.numel()
     grouped_mask = torch.zeros((num_groups, num_groups), dtype=torch.bool, device=dense_gen_mask.device)
@@ -481,10 +499,12 @@ def visualize_dense_teacher_forcing_gen_mask(
     query_sample_ids = representative_sample_ids.detach().cpu()
     query_stream_ids = representative_stream_ids.detach().cpu()
     query_block_ids = representative_block_ids.detach().cpu()
+    query_modality_ids = representative_modality_ids.detach().cpu()
     key_representatives = representatives
     key_sample_ids = layout.sample_ids.index_select(0, key_representatives).detach().cpu()
     key_stream_ids = layout.stream_ids.index_select(0, key_representatives).detach().cpu()
     key_block_ids = layout.block_ids.index_select(0, key_representatives).detach().cpu()
+    key_modality_ids = modality_ids.index_select(0, key_representatives).detach().cpu()
 
     # Pillow is intentionally imported only when the opt-in debug switch is on.
     from PIL import Image, ImageDraw
@@ -497,14 +517,18 @@ def visualize_dense_teacher_forcing_gen_mask(
     mask_height = max(num_rows * cell_size, 1)
 
     false_color = torch.tensor((24, 27, 35), dtype=torch.uint8)
+    # Keyed by (stream_id, modality_id): action columns get their own hues so
+    # video and action visibility can be told apart at a glance.
     visible_colors = {
-        int(TeacherForcingStream.UND): torch.tensor((245, 166, 35), dtype=torch.uint8),
-        int(TeacherForcingStream.CLEAN): torch.tensor((68, 190, 120), dtype=torch.uint8),
-        int(TeacherForcingStream.NOISY): torch.tensor((79, 145, 245), dtype=torch.uint8),
+        (int(TeacherForcingStream.UND), 0): torch.tensor((245, 166, 35), dtype=torch.uint8),
+        (int(TeacherForcingStream.CLEAN), 0): torch.tensor((68, 190, 120), dtype=torch.uint8),
+        (int(TeacherForcingStream.NOISY), 0): torch.tensor((79, 145, 245), dtype=torch.uint8),
+        (int(TeacherForcingStream.CLEAN), 1): torch.tensor((0, 137, 132), dtype=torch.uint8),
+        (int(TeacherForcingStream.NOISY), 1): torch.tensor((186, 104, 240), dtype=torch.uint8),
     }
     pixels = false_color.expand(num_rows, num_cols, 3).clone()
-    for column, stream_id in enumerate(key_stream_ids.tolist()):
-        pixels[grouped_mask[:, column], column] = visible_colors[int(stream_id)]
+    for column, (stream_id, modality_id) in enumerate(zip(key_stream_ids.tolist(), key_modality_ids.tolist())):
+        pixels[grouped_mask[:, column], column] = visible_colors[(int(stream_id), int(modality_id))]
 
     mask_image = Image.fromarray(pixels.numpy())
     if cell_size != 1:
@@ -512,23 +536,32 @@ def visualize_dense_teacher_forcing_gen_mask(
     image = Image.new("RGB", (left_margin + mask_width + 15, top_margin + mask_height + 15), "white")
     image.paste(mask_image, (left_margin, top_margin))
     draw = ImageDraw.Draw(image)
+    has_action = bool(modality_ids.any())
     draw.text((8, 8), "Teacher-forcing attention visibility (True = visible)", fill="black")
-    draw.text((8, 25), "rows/columns: [UND blocks | CLEAN blocks | NOISY blocks]", fill="black")
+    if has_action:
+        columns_hint = "[UND blocks | CLEAN V/A blocks | NOISY V/A blocks]"
+    else:
+        columns_hint = "[UND blocks | CLEAN blocks | NOISY blocks]"
+    draw.text((8, 25), f"rows/columns: {columns_hint}", fill="black")
     draw.text(
         (8, 44),
         f"und_block={und_block_size}, vision_block={layout.block_size}, history={layout.history_blocks}",
         fill="black",
     )
+    legend_entries = [
+        ("UND", tuple(visible_colors[(int(TeacherForcingStream.UND), 0)].tolist())),
+        ("CLEAN-V" if has_action else "CLEAN", tuple(visible_colors[(int(TeacherForcingStream.CLEAN), 0)].tolist())),
+        ("NOISY-V" if has_action else "NOISY", tuple(visible_colors[(int(TeacherForcingStream.NOISY), 0)].tolist())),
+    ]
+    if has_action:
+        legend_entries.insert(2, ("CLEAN-A", tuple(visible_colors[(int(TeacherForcingStream.CLEAN), 1)].tolist())))
+        legend_entries.append(("NOISY-A", tuple(visible_colors[(int(TeacherForcingStream.NOISY), 1)].tolist())))
+    legend_entries.append(("MASKED", tuple(false_color.tolist())))
     legend_x = 8
-    for label, color in (
-        ("UND", tuple(visible_colors[-1].tolist())),
-        ("CLEAN", tuple(visible_colors[0].tolist())),
-        ("NOISY", tuple(visible_colors[1].tolist())),
-        ("MASKED", tuple(false_color.tolist())),
-    ):
+    for label, color in legend_entries:
         draw.rectangle((legend_x, 66, legend_x + 10, 76), fill=color)
         draw.text((legend_x + 14, 65), label, fill="black")
-        legend_x += 69
+        legend_x += 20 + 6 * len(label)
 
     stream_names = {-1: "U", 0: "C", 1: "N"}
 
@@ -541,9 +574,10 @@ def visualize_dense_teacher_forcing_gen_mask(
         else:
             und_block_ids.append(-1)
 
-    def _label(sample_id: int, stream_id: int, block_id: int, und_block_id: int) -> str:
+    def _label(sample_id: int, stream_id: int, block_id: int, und_block_id: int, modality_id: int) -> str:
         suffix = str(und_block_id) if stream_id == int(TeacherForcingStream.UND) else str(block_id)
-        return f"s{sample_id}:{stream_names[stream_id]}{suffix}"
+        modality = "a" if modality_id == 1 else ""
+        return f"s{sample_id}:{stream_names[stream_id]}{suffix}{modality}"
 
     # Draw all labels when cells are readable; otherwise retain sample boundary
     # labels and the color legend so large packed batches remain interpretable.
@@ -554,6 +588,7 @@ def visualize_dense_teacher_forcing_gen_mask(
             int(query_stream_ids[row]),
             int(query_block_ids[row]),
             und_block_ids[row],
+            int(query_modality_ids[row]),
         )
         draw.text((4, top_margin + row * cell_size), label, fill="black")
     for column in range(0, num_cols, label_stride):
@@ -562,6 +597,7 @@ def visualize_dense_teacher_forcing_gen_mask(
             int(key_stream_ids[column]),
             int(key_block_ids[column]),
             und_block_ids[column],
+            int(key_modality_ids[column]),
         )
         label_image = Image.new("RGBA", (60, 12), (255, 255, 255, 0))
         ImageDraw.Draw(label_image).text((0, 0), label, fill="black")

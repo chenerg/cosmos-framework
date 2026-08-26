@@ -57,6 +57,10 @@ _IMAGE_FEATURES = {
 _EE_POSE_ACTION_SPACES = ("midtrain", "ee_pose_delta")
 _SUPPORTED_ACTION_SPACES = ("joint_pos",)
 
+# Wan VAE temporal compression: pixel frames per latent block. Whole-episode
+# mode sizes its fetch window in these blocks and truncates T to ``4N + 1``.
+_TEMPORAL_COMPRESSION_FACTOR = 4
+
 
 class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
     """RoboTwin dual-arm ALOHA action-policy dataset.
@@ -65,6 +69,13 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
     right_gripper]`` at the dataset's native 30 FPS grid, with the
     DROID-style three-view composite (``cam_high`` full-size on top, the two
     wrist cameras half-size below).
+
+    ``chunk_length == -1`` selects whole-episode mode (analogous to the SFT
+    dataset's ``num_video_frames == -1``): every episode yields exactly one
+    sample containing all frames/actions from frame 0, capped at
+    ``max_episode_blocks`` latent blocks (``1 + max_episode_blocks * 4``
+    observation frames).  Shorter episodes are trimmed via LeRobot's
+    ``*_is_pad`` masks and truncated to ``4N + 1`` frames for the VAE.
     """
 
     EMBODIMENT_TYPE: str = "robotwin_lerobot"
@@ -85,6 +96,7 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
         viewpoint: Viewpoint = "concat_view",
         use_image_augmentation: bool = False,
         enable_fast_init: bool = False,
+        max_episode_blocks: int = 30,
     ) -> None:
         if action_space in _EE_POSE_ACTION_SPACES:
             raise NotImplementedError(
@@ -99,6 +111,8 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
             )
         if viewpoint not in ("concat_view", "third_person_view"):
             raise ValueError(f"Unsupported viewpoint={viewpoint!r}. Use concat_view or third_person_view.")
+        if chunk_length == -1 and max_episode_blocks < 1:
+            raise ValueError(f"max_episode_blocks must be >= 1 in whole-episode mode, got {max_episode_blocks}")
 
         super().__init__(
             fps=fps,
@@ -119,12 +133,21 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
         self._use_state = use_state
         self._use_image_augmentation = use_image_augmentation
         self._image_augmentor: T.Compose | None = None
+        self._max_episode_blocks = max_episode_blocks
 
         # Single-dataset root (one task/embodiment dir containing meta/info.json).
         self._all_shard_roots = [root]
 
-        observation_ts = [i * self._dt for i in range(0, self._chunk_length + 1)]
-        action_ts = [i * self._dt for i in range(0, self._chunk_length)]
+        # Whole-episode mode queries a fixed window covering the cap; episodes
+        # shorter than the cap come back with clamped padding frames marked by
+        # LeRobot's ``*_is_pad`` masks, episodes longer than the cap are
+        # naturally truncated to the first ``query_chunk + 1`` frames.
+        if self._whole_episode:
+            query_chunk = max_episode_blocks * _TEMPORAL_COMPRESSION_FACTOR
+        else:
+            query_chunk = self._chunk_length
+        observation_ts = [i * self._dt for i in range(0, query_chunk + 1)]
+        action_ts = [i * self._dt for i in range(0, query_chunk)]
         self._delta_timestamps: dict[str, list[float]] = {_ACTION_FEATURE: action_ts}
         if self._use_state:
             self._delta_timestamps[_STATE_FEATURE] = observation_ts
@@ -193,11 +216,43 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
             Gripper(prefix="right"),
         )
 
+    def _whole_episode_target_frames(self, sample: dict[str, Any]) -> int:
+        """Un-padded observation frame count, truncated to ``4N + 1`` for the VAE.
+
+        LeRobot clamps out-of-episode query timestamps to the last frame and
+        flags them in ``<feature>_is_pad``, so the number of ``False`` entries
+        in an observation-grid mask is the episode's real frame count (capped
+        at the query window).  The observation grid is one entry longer than
+        the action grid, so prefer an observation feature's mask; without one
+        (``skip_video_loading`` and no state) fall back to the action mask,
+        which can only under-count by the final frame — harmless after the
+        ``4N + 1`` truncation.
+        """
+        if self._use_state:
+            pad_mask = sample[f"{_STATE_FEATURE}_is_pad"]
+        elif not self._skip_video_loading:
+            pad_mask = sample[f"{_IMAGE_FEATURES['top']}_is_pad"]
+        else:
+            pad_mask = sample[f"{_ACTION_FEATURE}_is_pad"]
+        n_frames = int((~pad_mask).sum().item())
+        if n_frames < 1 + _TEMPORAL_COMPRESSION_FACTOR:
+            raise ValueError(
+                f"Whole-episode sample has only {n_frames} valid frames; need at least "
+                f"{1 + _TEMPORAL_COMPRESSION_FACTOR} for one latent block."
+            )
+        return (n_frames - 1) // _TEMPORAL_COMPRESSION_FACTOR * _TEMPORAL_COMPRESSION_FACTOR + 1
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         mode, _, _, sample = self._fetch_sample(idx)
 
         # One instruction string per episode (no " | " multi-annotation).
         ai_caption = sample["task"]
+
+        # Whole-episode mode: trim LeRobot's clamped padding and truncate to 4N+1.
+        target_t = self._whole_episode_target_frames(sample) if self._whole_episode else None
+        if target_t is not None and not self._skip_video_loading:
+            image_keys = _IMAGE_FEATURES.values() if self._viewpoint == "concat_view" else [_IMAGE_FEATURES["top"]]
+            sample = {**sample, **{key: sample[key][:target_t] for key in image_keys}}
 
         if self._skip_video_loading:
             video = None
@@ -207,10 +262,17 @@ class RoboTwinLeRobotDataset(BaseActionLeRobotDataset):
             video = sample[_IMAGE_FEATURES["top"]]  # [T,C,H,W]
 
         # joint_pos: keep the native 14D layout; grippers are already in [0, 1].
-        action = sample[_ACTION_FEATURE][-self._chunk_length :].float()  # [chunk, 14]
-        if self._use_state:
-            initial_state = sample[_STATE_FEATURE][-self._chunk_length - 1].float()  # [14]
-            action = torch.cat([initial_state.unsqueeze(0), action], dim=0)  # [chunk+1, 14]
+        if target_t is not None:
+            # From frame 0: one action per frame gap -> target_t - 1 steps.
+            action = sample[_ACTION_FEATURE][: target_t - 1].float()  # [target_t-1, 14]
+            if self._use_state:
+                initial_state = sample[_STATE_FEATURE][0].float()  # [14]
+                action = torch.cat([initial_state.unsqueeze(0), action], dim=0)  # [target_t, 14]
+        else:
+            action = sample[_ACTION_FEATURE][-self._chunk_length :].float()  # [chunk, 14]
+            if self._use_state:
+                initial_state = sample[_STATE_FEATURE][-self._chunk_length - 1].float()  # [14]
+                action = torch.cat([initial_state.unsqueeze(0), action], dim=0)  # [chunk+1, 14]
 
         extras: dict[str, Any] = {}
         if self._viewpoint == "concat_view":

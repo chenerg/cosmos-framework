@@ -1124,15 +1124,19 @@ class Cosmos3VFMNetwork(PreTrainedModel):
                 output_root = Path(os.environ.get("IMAGINAIRE_OUTPUT_ROOT", "."))
                 output_path = output_root / "teacher_forcing_sdpa_bool_mask.png"
                 try:
+                    # Visualize on CPU: the dense [N, N] mask and its boolean
+                    # intermediates reach several GiB at long teacher-forcing
+                    # lengths and must not compete with training memory.
+                    layout_cpu = teacher_forcing_layout.to("cpu")
                     visualization_mask = attention_meta.dense_gen_mask
                     if visualization_mask is None:
                         visualization_mask = build_dense_teacher_forcing_gen_mask(
-                            teacher_forcing_layout,
+                            layout_cpu,
                             max_sequence_length=self.config.teacher_forcing_max_sequence_length,
                         )
                     saved_path = visualize_dense_teacher_forcing_gen_mask(
-                        visualization_mask,
-                        teacher_forcing_layout,
+                        visualization_mask.cpu(),
+                        layout_cpu,
                         output_path,
                     )
                     log.info(f"Saved complete teacher-forcing attention visualization to {saved_path}")

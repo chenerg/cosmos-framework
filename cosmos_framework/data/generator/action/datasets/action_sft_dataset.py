@@ -217,6 +217,7 @@ def get_action_robotwin_sft_dataset(
     root: str,
     fps: float = 30.0,
     chunk_length: int = 16,
+    max_episode_blocks: int = 30,
     action_space: str = "joint_pos",
     mode: str = "policy",
     use_state: bool = True,
@@ -242,12 +243,19 @@ def get_action_robotwin_sft_dataset(
     + optional ``use_state`` (raw/un-normalized), DROID-style concat_view
     (cam_high top, two wrist cameras bottom).
 
+    ``chunk_length=-1`` selects whole-episode mode: one sample per episode with
+    all frames/actions from frame 0, capped at ``max_episode_blocks`` latent
+    blocks (``1 + max_episode_blocks * 4`` observation frames) and truncated to
+    ``4N + 1`` frames for the VAE.  ``max_episode_blocks`` is ignored for
+    positive ``chunk_length``.
+
     ``root`` is a single RoboTwin-LeRobot-v3.0 task dataset dir (containing
     ``meta/info.json``), e.g. ``.../RoboTwin-LeRobot-v3.0/adjust_bottle/aloha-agilex_clean_50``."""
     dataset: Dataset = RoboTwinLeRobotDataset(
         root=root,
         fps=fps,
         chunk_length=chunk_length,
+        max_episode_blocks=max_episode_blocks,
         split_seed=split_seed,
         split_val_ratio=split_val_ratio,
         split=split,

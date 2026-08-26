@@ -245,8 +245,15 @@ def build_episode_spans(
     episode_ids: Sequence[int],
     chunk_length: int,
     sample_stride: int = 1,
+    whole_episode: bool = False,
 ) -> tuple[list[tuple[int, int, int]], int, int]:
     """Build valid episode spans for LeRobot frame queries.
+
+    When ``whole_episode`` is True (the ``chunk_length == -1`` mode), each
+    episode contributes exactly ONE sample anchored at its first frame:
+    the span is ``(episode_id, start, 1)`` and ``chunk_length`` /
+    ``sample_stride`` are ignored.  Episodes are never dropped for being
+    shorter than a chunk in this mode.
 
     Returns:
         - episode spans as ``(episode_id, sample_start, valid_len)``
@@ -265,11 +272,16 @@ def build_episode_spans(
     for episode_id in episode_ids:
         start = dataset_from_index[episode_id]
         stop = dataset_to_index[episode_id]
-        raw_valid_len = stop - start - chunk_length
-        if raw_valid_len > 0:
-            valid_len = (raw_valid_len + sample_stride - 1) // sample_stride
-            spans.append((episode_id, start, valid_len))
-            valid_count += valid_len
+        if whole_episode:
+            if stop - start > 0:
+                spans.append((episode_id, start, 1))
+                valid_count += 1
+        else:
+            raw_valid_len = stop - start - chunk_length
+            if raw_valid_len > 0:
+                valid_len = (raw_valid_len + sample_stride - 1) // sample_stride
+                spans.append((episode_id, start, valid_len))
+                valid_count += valid_len
         sample_count += int(length[episode_id])
 
     return spans, valid_count, sample_count
@@ -333,6 +345,9 @@ class BaseActionLeRobotDataset(Dataset):
         self._memprofile = _memprofile_enabled()
 
         assert sample_stride >= 1, f"sample_stride must be >= 1, got {sample_stride}"
+        assert chunk_length == -1 or chunk_length >= 1, (
+            f"chunk_length must be >= 1, or -1 for whole-episode mode; got {chunk_length}"
+        )
         assert fast_init_max_workers >= 1, f"fast_init_max_workers must be >= 1, got {fast_init_max_workers}"
         assert action_normalization is None or action_normalization in _ACTION_NORMALIZATION_CHOICES, (
             f"action_normalization must be None or one of {_ACTION_NORMALIZATION_CHOICES}, got {action_normalization!r}"
@@ -342,6 +357,12 @@ class BaseActionLeRobotDataset(Dataset):
             self._fps = fps
             self._dt = 1.0 / fps
             self._chunk_length = chunk_length
+            # chunk_length == -1 selects whole-episode mode: one sample per
+            # episode, anchored at frame 0 (mirrors the SFT dataset's
+            # ``num_video_frames == -1``).  Subclasses cap the fetch window via
+            # their own ``_delta_timestamps`` and trim LeRobot's clamped
+            # padding with the returned ``*_is_pad`` masks.
+            self._whole_episode = chunk_length == -1
             self._split_seed = split_seed
             self._split_val_ratio = split_val_ratio
             self._split = _normalize_split(split)
@@ -532,6 +553,7 @@ class BaseActionLeRobotDataset(Dataset):
             episode_ids=episode_ids,
             chunk_length=self._chunk_length,
             sample_stride=self._sample_stride,
+            whole_episode=self._whole_episode,
         )
 
         # Optional duration filter (see ``self._min_episode_length_frames``

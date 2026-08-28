@@ -115,9 +115,16 @@ def get_action_droid_sft_dataset(
     iterable_shuffle: bool = False,
     episode_shuffle_seed: int = 42,
     use_success_only: bool = True,
+    max_episode_blocks: int = -1,
 ) -> Dataset:
     """Build the DROID action SFT dataset: ``action_space='joint_pos'`` (8D) +
     ``use_state`` (raw/un-normalized), concat_view, chunk_length 32.
+
+    ``chunk_length=-1`` selects whole-episode mode: one sample per episode,
+    fetched at the episode's exact length, rounded UP to ``4N + 1`` frames
+    with tail-frame / last-action padding.  ``max_episode_blocks`` caps the
+    length at ``1 + max_episode_blocks * 4`` observation frames (``-1`` =
+    unlimited); it only applies in whole-episode mode.
 
     Reads ``root`` (a merged/versioned DROID LeRobot root) as a single flat
     dataset; ``use_success_only=True`` filters to the ``success/`` split."""
@@ -133,6 +140,7 @@ def get_action_droid_sft_dataset(
         use_filter_dict=use_filter_dict,
         filter_dict_path=filter_dict_path,
         use_success_only=use_success_only,
+        max_episode_blocks=max_episode_blocks,
     )
     dataset: Dataset = DROIDLeRobotDataset(root=root, **shard_kwargs)
     transform = ActionTransformPipeline(
@@ -217,7 +225,7 @@ def get_action_robotwin_sft_dataset(
     root: str,
     fps: float = 30.0,
     chunk_length: int = 16,
-    max_episode_blocks: int = 30,
+    max_episode_blocks: int = -1,
     action_space: str = "joint_pos",
     mode: str = "policy",
     use_state: bool = True,
@@ -244,10 +252,11 @@ def get_action_robotwin_sft_dataset(
     (cam_high top, two wrist cameras bottom).
 
     ``chunk_length=-1`` selects whole-episode mode: one sample per episode with
-    all frames/actions from frame 0, capped at ``max_episode_blocks`` latent
-    blocks (``1 + max_episode_blocks * 4`` observation frames) and truncated to
-    ``4N + 1`` frames for the VAE.  ``max_episode_blocks`` is ignored for
-    positive ``chunk_length``.
+    all frames/actions from frame 0, fetched at the episode's exact length and
+    rounded UP to ``4N + 1`` frames with tail-frame / last-action padding.
+    ``max_episode_blocks`` caps the length at ``1 + max_episode_blocks * 4``
+    observation frames (``-1`` = unlimited); it is ignored for positive
+    ``chunk_length``.
 
     ``root`` is a single RoboTwin-LeRobot-v3.0 task dataset dir (containing
     ``meta/info.json``), e.g. ``.../RoboTwin-LeRobot-v3.0/adjust_bottle/aloha-agilex_clean_50``."""

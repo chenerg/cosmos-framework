@@ -754,6 +754,19 @@ class WanVAE_(nn.Module):
         """Fresh per-layer cache for the decoder (one slot per CausalConv3d)."""
         return [None] * self._dec_conv_num
 
+    def _should_pad(self, T: int) -> bool:
+        """Whether ``encode`` should pad ``T`` frames to the temporal_window boundary.
+
+        Padding exists solely to keep chunk shapes fixed for the AOT-compiled
+        dispatch, so it only applies once ``_aot_chunk_fns`` has been installed
+        (via :meth:`Wan2pt2VAEInterface.compile_encode`).  In eager mode the
+        chunked encode handles any 4N+1 length exactly, and padding would be
+        pure extra compute.  Durations listed in ``encode_exact_durations`` are
+        exempt even under AOT (their remainder-chunk shapes are pre-compiled).
+        """
+        aot_installed = getattr(self, "_aot_chunk_fns", None) is not None
+        return aot_installed and T not in self._encode_exact_durations
+
     def forward(self, x, scale):
         mu = self.encode(x, scale)
         x_recon = self.decode(mu, scale, clear_decoder_cache=True)
@@ -828,9 +841,10 @@ class WanVAE_(nn.Module):
         When ``_aot_chunk_fns`` has been installed (via
         :meth:`Wan2pt2VAEInterface.compile_encode`),
         each chunk is dispatched to a pre-compiled ``.pt2`` function keyed by
-        ``(T_chunk, H_patch, W_patch, cache_t)``.  Padding ensures every chunk
-        (except possibly the last, handled by ``should_pad``) has exactly
-        ``temporal_window`` frames, keeping the set of compiled input shapes small.
+        ``(T_chunk, H_patch, W_patch, cache_t)``.  Only then is the input padded
+        to the ``temporal_window`` boundary (see :meth:`_should_pad`), keeping
+        the set of compiled input shapes small.  Without AOT (eager mode) every
+        4N+1 duration is encoded at its exact length — no padding.
 
         Args:
             x: Pixel-space video tensor of shape ``[B, 3, T, H, W]``.
@@ -866,12 +880,11 @@ class WanVAE_(nn.Module):
         # For T=1 (single image), latent_T=1.  For T=4n+1, latent_T=n+1.
         latent_T = 1 + (T - 1) // 4
 
-        # Certain short-clip durations (e.g. robotics datasets with T=17) can be
-        # encoded at their exact length, avoiding the overhead of padding to the
-        # next chunk boundary.  All other lengths are padded so that each chunk
-        # has exactly ``temporal_window`` frames, giving the compiled function a
-        # fixed input shape per {resolution, aspect_ratio} bucket.
-        should_pad = T not in self._encode_exact_durations
+        # Padding to the chunk boundary exists solely for the AOT-compiled
+        # dispatch (fixed input shape per {resolution, aspect_ratio} bucket);
+        # in eager mode every 4N+1 duration is encoded at its exact length.
+        # See _should_pad for details.
+        should_pad = self._should_pad(T)
 
         if should_pad:
             # Pad T to ``1 + k * temporal_window`` so that after removing the 1-frame
@@ -1354,9 +1367,11 @@ class Wan2pt2VAEInterface(VideoTokenizerInterface):
         # use a dictionary of chunk frames, one for each resolution. If a single integer is provided,
         # it will be used for all resolutions.
         encode_chunk_frames: int | Mapping[str, int] = 4,
-        # Exact frame durations that get encoded without padding. Useful for short-clip datasets
-        # (e.g. robotics) where the standard bucketing would inflate the input by many multiples
-        # (e.g. 17 frames → 69 with encode_chunk_frames=68). Must be a list of integers.
+        # Exact frame durations that get encoded without padding even under AOT compilation.
+        # Useful for short-clip datasets (e.g. robotics) where the standard bucketing would
+        # inflate the input by many multiples (e.g. 17 frames → 69 with encode_chunk_frames=68).
+        # Must be a list of integers. Only meaningful when compile_encode (AOT) is used —
+        # without AOT the encoder never pads (see WanVAE_._should_pad).
         encode_exact_durations: list[int] | None = None,
         # Compression factors for spatial and temporal dimensions (4x16x16 tokenizer).
         spatial_compression_factor: int = 16,

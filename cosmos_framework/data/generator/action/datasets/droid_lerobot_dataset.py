@@ -86,8 +86,27 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         enable_fast_init: bool = False,
         max_num_history_actions: int = 0,
         use_image_augmentation: bool = False,
+        max_episode_blocks: int = -1,
     ) -> None:
         """ """
+        if chunk_length == -1:
+            # Whole-episode mode uses head-anchored, exact-length fetching;
+            # these options assume the tail-anchored sliding-window layout.
+            if action_space != "joint_pos":
+                raise ValueError(
+                    f"Whole-episode mode (chunk_length=-1) only supports action_space='joint_pos', "
+                    f"got {action_space!r}."
+                )
+            if use_filter_dict:
+                raise ValueError("Whole-episode mode (chunk_length=-1) does not support use_filter_dict.")
+            if max_num_history_actions > 0:
+                raise ValueError("Whole-episode mode (chunk_length=-1) does not support max_num_history_actions.")
+            if split == "val_temp_seg":
+                raise ValueError("Whole-episode mode (chunk_length=-1) does not support split='val_temp_seg'.")
+            if video_mode is not None:
+                raise ValueError(
+                    f"Whole-episode mode (chunk_length=-1) only supports video_mode=None, got {video_mode!r}."
+                )
         super().__init__(
             fps=fps,
             chunk_length=chunk_length,
@@ -102,6 +121,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             action_normalization=action_normalization,
             tolerance_s=tolerance_s,
             enable_fast_init=enable_fast_init,
+            max_episode_blocks=max_episode_blocks,
         )
         self._use_success_only = use_success_only
         self._video_mode = video_mode
@@ -136,30 +156,38 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
 
         self._all_shard_roots = [os.path.join(root, x) for x in lerobot_roots] if lerobot_roots else [root]
 
-        observation_ts = [i * self._dt for i in range(0, self._chunk_length + 1)]
-        action_ts = [i * self._dt for i in range(0, self._chunk_length)]
-        if self._max_num_history_actions > 0 and self._action_space in ("midtrain", "joint_pos"):
-            observation_ts_ext = [i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length + 1)]
-            action_ts_ext = [i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length)]
+        if self._whole_episode:
+            # Whole-episode mode bypasses LeRobotDataset.__getitem__ entirely
+            # (see BaseActionLeRobotDataset._fetch_whole_episode), so no fixed
+            # delta_timestamps window is registered.
+            self._delta_timestamps: dict[str, list[float]] = {}
         else:
-            observation_ts_ext = observation_ts
-            action_ts_ext = action_ts
-        self._delta_timestamps: dict[str, list[float]] = {
-            self._state_features: observation_ts_ext,
-            self._action_features: action_ts_ext,
-        }
-        if self._viewpoint in ("wrist_view", "concat_view"):
-            self._delta_timestamps[self._image_features["wrist"]] = observation_ts
-        if self._viewpoint in ("third_person_view", "concat_view"):
-            self._delta_timestamps[self._image_features["left"]] = observation_ts
-            self._delta_timestamps[self._image_features["right"]] = observation_ts
-        if self._action_space == "joint_pos":
-            self._delta_timestamps[_JOINT_ACTION_FEATURE] = action_ts
-            if self._use_state or self._max_num_history_actions > 0:
-                self._delta_timestamps[_JOINT_STATE_FEATURE] = observation_ts_ext
-                self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts_ext
-        if self._use_state and self._action_space != "joint_pos":
-            self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts
+            observation_ts = [i * self._dt for i in range(0, self._chunk_length + 1)]
+            action_ts = [i * self._dt for i in range(0, self._chunk_length)]
+            if self._max_num_history_actions > 0 and self._action_space in ("midtrain", "joint_pos"):
+                observation_ts_ext = [
+                    i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length + 1)
+                ]
+                action_ts_ext = [i * self._dt for i in range(-self._max_num_history_actions, self._chunk_length)]
+            else:
+                observation_ts_ext = observation_ts
+                action_ts_ext = action_ts
+            self._delta_timestamps = {
+                self._state_features: observation_ts_ext,
+                self._action_features: action_ts_ext,
+            }
+            if self._viewpoint in ("wrist_view", "concat_view"):
+                self._delta_timestamps[self._image_features["wrist"]] = observation_ts
+            if self._viewpoint in ("third_person_view", "concat_view"):
+                self._delta_timestamps[self._image_features["left"]] = observation_ts
+                self._delta_timestamps[self._image_features["right"]] = observation_ts
+            if self._action_space == "joint_pos":
+                self._delta_timestamps[_JOINT_ACTION_FEATURE] = action_ts
+                if self._use_state or self._max_num_history_actions > 0:
+                    self._delta_timestamps[_JOINT_STATE_FEATURE] = observation_ts_ext
+                    self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts_ext
+            if self._use_state and self._action_space != "joint_pos":
+                self._delta_timestamps[_GRIPPER_STATE_FEATURE] = observation_ts
 
         if self._use_filter_dict:
             with open(self._filter_dict_path) as f:
@@ -334,6 +362,27 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             return build_action_spec(Joint(n=7, label="joint"), Gripper())
         return build_action_spec(Pos(), Rot("rot6d"), Gripper())
 
+    def _whole_episode_tabular_grids(self) -> dict[str, str]:
+        """Whole-episode tabular features (``joint_pos`` only, enforced in __init__)."""
+        grids = {
+            self._action_features: "act",  # gripper action
+            _JOINT_ACTION_FEATURE: "act",
+        }
+        if self._use_state:
+            grids[_JOINT_STATE_FEATURE] = "obs"
+            grids[_GRIPPER_STATE_FEATURE] = "obs"
+        return grids
+
+    def _whole_episode_camera_features(self) -> list[str]:
+        """Cameras to decode in whole-episode mode, per viewpoint."""
+        keys: list[str] = []
+        if self._viewpoint in ("wrist_view", "concat_view"):
+            keys.append(self._image_features["wrist"])
+        if self._viewpoint in ("third_person_view", "concat_view"):
+            keys.append(self._image_features["left"])
+            keys.append(self._image_features["right"])
+        return keys
+
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """ """
         mode, _, _, sample = self._fetch_sample(idx)
@@ -444,7 +493,20 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                     np.concatenate((pose[0, :3, 3], pose[0, :3, 0], pose[0, :3, 1], initial_gripper), axis=-1)
                 ).float()
                 action = torch.cat([initial_state.unsqueeze(0), action], dim=0)
-        if self._action_space == "joint_pos":
+        if self._action_space == "joint_pos" and self._whole_episode:
+            # Whole-episode fetch returns exact-length, head-anchored tensors:
+            # act-grid features have target_t - 1 rows (tail padding included).
+            gripper = sample[self._action_features].unsqueeze(-1)  # [T-1,1]
+            if self._is_gripper_action_flipped:
+                gripper = 1.0 - gripper
+            action = torch.cat((sample[_JOINT_ACTION_FEATURE], gripper), dim=-1).float()  # [T-1,8]
+            if self._use_state:
+                initial_gripper = sample[_GRIPPER_STATE_FEATURE][0].unsqueeze(-1)
+                if self._is_gripper_action_flipped:
+                    initial_gripper = 1.0 - initial_gripper
+                initial_state = torch.cat((sample[_JOINT_STATE_FEATURE][0], initial_gripper), dim=-1).float()
+                action = torch.cat([initial_state.unsqueeze(0), action], dim=0)  # [T,8]
+        elif self._action_space == "joint_pos":
             gripper = sample[self._action_features][-self._chunk_length :].unsqueeze(-1)
             if self._is_gripper_action_flipped:
                 gripper = 1.0 - gripper

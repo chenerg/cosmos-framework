@@ -114,6 +114,10 @@ _LRU_DATASET_MAX_LOADED: int = 32
 ActionNormalization = ActionNormalizationMethod
 _ACTION_NORMALIZATION_CHOICES: tuple[str, ...] = ("quantile", "quantile_rot", "meanstd", "minmax")
 
+# Wan VAE temporal compression: pixel frames per latent block. Whole-episode
+# mode sizes its cap in these blocks and rounds T up to ``4N + 1``.
+_VAE_TEMPORAL_COMPRESSION_FACTOR: int = 4
+
 _decoder_cache_patched = False
 
 
@@ -253,7 +257,8 @@ def build_episode_spans(
     episode contributes exactly ONE sample anchored at its first frame:
     the span is ``(episode_id, start, 1)`` and ``chunk_length`` /
     ``sample_stride`` are ignored.  Episodes are never dropped for being
-    shorter than a chunk in this mode.
+    shorter than a chunk in this mode — only degenerate single-frame
+    episodes (no action step) are skipped.
 
     Returns:
         - episode spans as ``(episode_id, sample_start, valid_len)``
@@ -273,7 +278,10 @@ def build_episode_spans(
         start = dataset_from_index[episode_id]
         stop = dataset_to_index[episode_id]
         if whole_episode:
-            if stop - start > 0:
+            # Require at least 2 frames (one action step); single-frame
+            # episodes have nothing to supervise and would crash the
+            # whole-episode fetch.
+            if stop - start >= 2:
                 spans.append((episode_id, start, 1))
                 valid_count += 1
         else:
@@ -338,6 +346,7 @@ class BaseActionLeRobotDataset(Dataset):
         enable_fast_init: bool = False,
         fast_init_max_workers: int = 64,
         min_episode_length_frames: int | None = None,
+        max_episode_blocks: int = -1,
     ) -> None:
         super().__init__()
         _ensure_hf_hub_offline()
@@ -348,6 +357,23 @@ class BaseActionLeRobotDataset(Dataset):
         assert chunk_length == -1 or chunk_length >= 1, (
             f"chunk_length must be >= 1, or -1 for whole-episode mode; got {chunk_length}"
         )
+        assert max_episode_blocks == -1 or max_episode_blocks >= 1, (
+            f"max_episode_blocks must be >= 1, or -1 for unlimited; got {max_episode_blocks}"
+        )
+        if chunk_length != -1 and max_episode_blocks != -1:
+            log.warning(
+                f"{self.__class__.__name__}: max_episode_blocks={max_episode_blocks} is ignored in "
+                f"windowed mode (chunk_length={chunk_length}); it only applies when chunk_length == -1."
+            )
+        if chunk_length == -1:
+            # Whole-episode mode bypasses LeRobotDataset.__getitem__ (fixed
+            # delta_timestamps) and issues per-episode queries through these
+            # private lerobot APIs — fail early if a lerobot upgrade removed them.
+            for _attr in ("_query_hf_dataset", "_query_videos", "_ensure_hf_dataset_loaded"):
+                assert hasattr(LeRobotDataset, _attr), (
+                    f"Whole-episode mode requires LeRobotDataset.{_attr}; "
+                    "the installed lerobot version no longer provides it."
+                )
         assert fast_init_max_workers >= 1, f"fast_init_max_workers must be >= 1, got {fast_init_max_workers}"
         assert action_normalization is None or action_normalization in _ACTION_NORMALIZATION_CHOICES, (
             f"action_normalization must be None or one of {_ACTION_NORMALIZATION_CHOICES}, got {action_normalization!r}"
@@ -359,10 +385,13 @@ class BaseActionLeRobotDataset(Dataset):
             self._chunk_length = chunk_length
             # chunk_length == -1 selects whole-episode mode: one sample per
             # episode, anchored at frame 0 (mirrors the SFT dataset's
-            # ``num_video_frames == -1``).  Subclasses cap the fetch window via
-            # their own ``_delta_timestamps`` and trim LeRobot's clamped
-            # padding with the returned ``*_is_pad`` masks.
+            # ``num_video_frames == -1``).  Fetching bypasses the fixed
+            # ``delta_timestamps`` window: ``_fetch_whole_episode`` queries each
+            # episode at its exact length (capped at ``max_episode_blocks``
+            # latent blocks unless -1), rounds T up to ``4N + 1``, and pads by
+            # repeating the tail row — no ``*_is_pad`` post-processing needed.
             self._whole_episode = chunk_length == -1
+            self._max_episode_blocks = max_episode_blocks
             self._split_seed = split_seed
             self._split_val_ratio = split_val_ratio
             self._split = _normalize_split(split)
@@ -772,7 +801,7 @@ class BaseActionLeRobotDataset(Dataset):
         Returns ``(mode, dataset_idx, row_idx, sample_dict)``.
         """
         mode = self._choose_mode()
-        dataset_idx, row_idx, _, _ = self._resolve_index(idx)
+        dataset_idx, row_idx, episode_id, _ = self._resolve_index(idx)
 
         self._getitem_count = getattr(self, "_getitem_count", 0) + 1
         profile = self._memprofile and self._getitem_count % 50 == 1
@@ -782,12 +811,126 @@ class BaseActionLeRobotDataset(Dataset):
             enabled=profile,
             after_fn=lambda: log_worker_memory_breakdown(self),
         ):
-            sample = self._get_dataset(dataset_idx)[row_idx]
+            ds = self._get_dataset(dataset_idx)
+            if self._whole_episode:
+                sample = self._fetch_whole_episode(ds, episode_id)
+            else:
+                sample = ds[row_idx]
 
         if self._skip_video_loading:
             sample = defaultdict(lambda: None, sample)
 
         return mode, dataset_idx, row_idx, sample
+
+    # -- whole-episode fetching (chunk_length == -1) ---------------------------
+
+    def _whole_episode_tabular_grids(self) -> dict[str, str]:
+        """Map tabular feature names to their temporal grid for whole-episode mode.
+
+        Returns a dict ``{feature_name: "obs" | "act"}``:
+
+        - ``"obs"`` features are queried on the observation grid
+          (``target_t`` rows — one per video frame);
+        - ``"act"`` features are queried on the action grid
+          (``target_t - 1`` rows — one per frame gap).
+
+        Subclasses that support whole-episode mode must implement this.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support whole-episode fetching.")
+
+    def _whole_episode_camera_features(self) -> list[str]:
+        """Video feature names to decode in whole-episode mode (viewpoint-dependent).
+
+        Subclasses that support whole-episode mode must implement this.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support whole-episode fetching.")
+
+    def _whole_episode_rows(self, ds: LeRobotDataset, episode_id: int) -> tuple[list[int], list[int], int]:
+        """Build the absolute row indices covering one whole episode.
+
+        Subsamples the native-FPS rows down to ``self._fps`` (integer stride),
+        caps at ``1 + 4 * max_episode_blocks`` frames (no cap when -1), rounds
+        the frame count UP to ``4N + 1`` for the VAE, and pads by repeating the
+        last real row — so the fetched tensors come back tail-padded and no
+        ``*_is_pad`` post-processing is needed.
+
+        Returns:
+            ``(obs_rows, act_rows, n_real)`` where ``obs_rows`` has
+            ``target_t`` entries, ``act_rows = obs_rows[:target_t - 1]``, and
+            ``n_real`` is the un-padded (post-cap) frame count.
+        """
+        ep = ds.meta.episodes[episode_id]
+        start = int(ep["dataset_from_index"])
+        stop = int(ep["dataset_to_index"])
+
+        native_fps = float(ds.meta.fps)
+        stride_f = native_fps / self._fps
+        stride = max(1, int(round(stride_f)))
+        assert abs(stride - stride_f) < 1e-6, (
+            f"{self.__class__.__name__}: whole-episode mode requires an integer native/target FPS "
+            f"ratio, got native={native_fps} / target={self._fps} = {stride_f}"
+        )
+
+        obs_rows = list(range(start, stop, stride))
+        n = len(obs_rows)
+        if self._max_episode_blocks != -1:
+            n = min(n, 1 + self._max_episode_blocks * _VAE_TEMPORAL_COMPRESSION_FACTOR)
+            obs_rows = obs_rows[:n]
+        if n < 2:
+            raise ValueError(
+                f"{self.__class__.__name__}: whole-episode sample for episode {episode_id} has only "
+                f"{n} valid frames after subsampling; need at least 2 (one action step)."
+            )
+
+        tcf = _VAE_TEMPORAL_COMPRESSION_FACTOR
+        target_t = (n - 1 + tcf - 1) // tcf * tcf + 1  # round UP to 4N+1
+        obs_rows = obs_rows + [obs_rows[-1]] * (target_t - n)  # tail-row padding
+        act_rows = obs_rows[: target_t - 1]
+        return obs_rows, act_rows, n
+
+    def _rows_to_timestamps(self, ds: LeRobotDataset, rows: list[int]) -> list[float]:
+        """Episode-relative timestamps for the given absolute row indices.
+
+        Mirrors lerobot's ``_get_query_timestamps`` row-access pattern,
+        including the absolute-to-relative index mapping.
+        """
+        abs_to_rel = getattr(ds, "_absolute_to_relative_idx", None)
+        rel = rows if abs_to_rel is None else [abs_to_rel[r] for r in rows]
+        timestamps = ds.hf_dataset[rel]["timestamp"]
+        return torch.stack(list(timestamps)).tolist()
+
+    def _fetch_whole_episode(self, ds: LeRobotDataset, episode_id: int) -> dict[str, Any]:
+        """Fetch one whole episode at its exact length (whole-episode mode).
+
+        Bypasses ``LeRobotDataset.__getitem__`` (fixed ``delta_timestamps``)
+        and issues per-episode queries: tabular features via
+        ``_query_hf_dataset`` and camera frames via ``_query_videos``.  The
+        tail padding to ``4N + 1`` is realized at the row-index level (the
+        repeated last row / timestamp), so the returned tensors are already
+        exactly sized: obs-grid features have ``target_t`` rows, act-grid
+        features ``target_t - 1``.
+        """
+        ds._ensure_hf_dataset_loaded()
+        obs_rows, act_rows, _ = self._whole_episode_rows(ds, episode_id)
+
+        query_indices: dict[str, list[int]] = {
+            feature: (obs_rows if grid == "obs" else act_rows)
+            for feature, grid in self._whole_episode_tabular_grids().items()
+        }
+        # Piggyback the episode's task index on the tabular query (first row).
+        query_indices["task_index"] = [obs_rows[0]]
+        sample: dict[str, Any] = ds._query_hf_dataset(query_indices)
+        task_index = int(sample.pop("task_index")[0].item())
+        sample["task"] = ds.meta.tasks.iloc[task_index].name
+
+        if not self._skip_video_loading:
+            camera_keys = self._whole_episode_camera_features()
+            if camera_keys:
+                query_ts = self._rows_to_timestamps(ds, obs_rows)
+                video_frames = ds._query_videos({key: query_ts for key in camera_keys}, episode_id)
+                sample.update(video_frames)
+
+        return sample
 
     # -- action normalization ------------------------------------------------
 

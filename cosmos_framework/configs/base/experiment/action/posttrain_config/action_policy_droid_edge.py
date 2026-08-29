@@ -1,17 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""``action_policy_libero_edge`` — Cosmos3-Edge LIBERO-10 action-policy SFT recipe.
+"""``action_policy_droid_edge`` — Cosmos3-Edge DROID action-policy SFT recipe.
 
-Edge-tier sibling of ``action_policy_libero_nano``: same LIBERO dataflow
-(``LIBEROLeRobotDataset``, frame-wise-relative rot6d, ``quantile_rot``,
-concat_view third-person + wrist), same optimizer / scheduler / trainer /
-checkpoint blocks, but the model baseline is ``EDGE_MODEL_CONFIG``
-(Nemotron-2B-Dense-VL dense backbone) instead of ``NANO_MODEL_CONFIG``.
-``EDGE_MODEL_CONFIG`` already ships ``action_gen=True`` and the video-style
-loss scales (``loss_scale=10.0``, ``image_loss_scale=None``), so only the
-action-recipe deltas are applied here. Train on ``libero_10`` alone
-(``LIBERO_ROOT``). See docs/action_policy_libero_sft.md.
+Edge-tier sibling of ``action_policy_droid_nano``: same DROID dataflow
+(``DROIDLeRobotDataset``, ``joint_pos`` 8D + ``use_state``, raw/un-normalized,
+    concat_view 480p, whole-episode ``chunk_length=-1``, JSON action prompts), same optimizer /
+scheduler / trainer / checkpoint blocks, but the model baseline is
+``EDGE_MODEL_CONFIG`` (Nemotron-2B-Dense-VL dense backbone) instead of
+``NANO_MODEL_CONFIG``. ``EDGE_MODEL_CONFIG`` already ships ``action_gen=True``
+and the video-style loss scales (``loss_scale=10.0``, ``image_loss_scale=None``),
+so only the action-recipe deltas are applied here. ``DROID_ROOT`` is the
+versioned parent (e.g. ``.../droid_plus_lerobot_640x360_20260412``);
+``use_success_only=True`` keeps the success split.
 """
 
 import copy
@@ -19,7 +20,7 @@ import copy
 from hydra.core.config_store import ConfigStore
 
 from cosmos_framework.configs.base.experiment.sft.models.edge_model_config import EDGE_MODEL_CONFIG
-from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_libero_sft_dataset
+from cosmos_framework.data.generator.action.datasets.action_sft_dataset import get_action_droid_sft_dataset
 from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
@@ -30,22 +31,23 @@ from cosmos_framework.utils.lazy_config import LazyDict
 cs = ConfigStore.instance()
 
 
-def _action_policy_libero_edge_model_config() -> dict:
-    """LIBERO model config on the Edge baseline: capped packed tokens, selective
+def _action_policy_droid_edge_model_config() -> dict:
+    """DROID model config on the Edge baseline: capped packed tokens, selective
     activation checkpointing, fresh diffusion-expert init. Keep
-    ``encode_exact_durations=[17, 61, 73]`` to match the Cosmos3 base."""
+    ``encode_exact_durations=[17, 61, 73]`` as VAE warmup shapes; whole-episode
+    4N+1 lengths not in the list fall back to eager exact encode."""
     cfg = copy.deepcopy(EDGE_MODEL_CONFIG)  # action_gen=True, max_action_dim=64
-    # Cap the packed sequence (same bound as the nano action recipe; uncapped
-    # packs one very long sequence and OOMs).
+    # Cap the packed sequence (same bound as the other Edge action recipes;
+    # the nano DROID recipe uncaps to -1, which OOMs on a single NPU).
     cfg["max_num_tokens_after_packing"] = 74000
     cfg["activation_checkpointing"]["mode"] = "selective"
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     # Edge baseline already sets rectified_flow loss_scale=10.0 / image_loss_scale=None.
-    cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]  # match Cosmos3 base + reference SFT (do NOT reduce)
+    cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]
     return cfg
 
 
-action_policy_libero_edge = LazyDict(
+action_policy_droid_edge = LazyDict(
     dict(
         defaults=[
             {"override /model": "mot_fsdp"},
@@ -73,11 +75,11 @@ action_policy_libero_edge = LazyDict(
         job=dict(
             project="cosmos3",
             group="action_sft",
-            name="action_policy_libero_edge",
+            name="action_policy_droid_edge",
             wandb_mode="disabled",
         ),
         model=dict(
-            config=_action_policy_libero_edge_model_config(),
+            config=_action_policy_droid_edge_model_config(),
         ),
         optimizer=dict(
             betas=[0.9, 0.99],
@@ -95,7 +97,7 @@ action_policy_libero_edge = LazyDict(
                 "llm2action",
                 "action_modality_embed",
             ],
-            lr=5.0e-05,
+            lr=2.0e-04,  # DROID nano reference (gbs 8192); local TOML lowers this
             lr_multipliers={
                 "action2llm": 5.0,
                 "llm2action": 5.0,
@@ -107,11 +109,11 @@ action_policy_libero_edge = LazyDict(
         scheduler=dict(
             lr_scheduler_type="LambdaLinear",
             cycle_lengths=[100],  # smoke: 100 iters (real run sets via TOML)
-            f_max=[1.0],
+            f_max=[0.4],  # matches the DROID nano recipe
             f_min=[0.0],
-            f_start=[1.0e-06],
+            f_start=[0.0],
             verbosity_interval=0,
-            warm_up_steps=[0],  # smoke (real run sets via TOML)
+            warm_up_steps=[0],  # smoke (real / local run sets via TOML)
         ),
         trainer=dict(
             distributed_parallelism="fsdp",
@@ -150,8 +152,8 @@ action_policy_libero_edge = LazyDict(
             enable_gcs_patch_in_boto3=True,
             keys_not_to_resume=[],
             # Skip net_ema (EMA warm-starts from net, see dcp.py) and the action
-            # heads, so they init fresh from the base (matches the nano recipe;
-            # the base action heads are not LIBERO-trained).
+            # heads, so they init fresh from the base (the base action heads are
+            # not DROID-trained).
             keys_to_skip_loading=[
                 "net_ema.",
                 "action2llm",
@@ -178,8 +180,8 @@ action_policy_libero_edge = LazyDict(
         ),
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
-            dataset_name="action_libero",
-            max_samples_per_batch=1,  # one whole episode per micro-batch; override via TOML for small-rank local runs
+            dataset_name="action_droid",
+            max_samples_per_batch=1,  # one whole episode per micro-batch; override via TOML
             max_sequence_length=None,  # None disables token packing (TOML can't express null)
             patch_spatial=2,
             sound_latent_fps=0,
@@ -197,34 +199,41 @@ action_policy_libero_edge = LazyDict(
                 # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-
                 # shuffled, sequential-within-episode.
                 datasets=dict(
-                    libero=dict(
+                    droid=dict(
                         ratio=1,
-                        dataset=L(get_action_libero_sft_dataset)(
-                            # Local LeRobot dir for the libero_10 suite ONLY. Use the
-                            # 20 FPS nvidia/LIBERO_LeRobot_v3 (matches the bundled stats + 20 Hz eval):
-                            #   hf download nvidia/LIBERO_LeRobot_v3 --repo-type dataset \
-                            #     --include 'libero_10/**' --local-dir <dir>   # LIBERO_ROOT=<dir>/libero_10
-                            root="${oc.env:LIBERO_ROOT}",
-                            fps=20,  # metadata only (FPS-agnostic loader reads native fps from info.json)
+                        dataset=L(get_action_droid_sft_dataset)(
+                            # Versioned DROID LeRobot parent (basename must be a LEROBOT_ROOTS
+                            # key). use_success_only=True keeps success/. Example:
+                            #   DROID_ROOT=.../droid_plus_lerobot_640x360_20260412
+                            root="${oc.env:DROID_ROOT}",
+                            fps=15.0,
                             # -1 = whole-episode: one sample per episode, all frames from 0,
                             # no max_episode_blocks cap (4N+1 tail padding only).
                             chunk_length=-1,
                             max_episode_blocks=-1,
-                            image_size=256,  # concat_view -> 256x512
+                            action_space="joint_pos",
+                            # Policy-only task mode. "joint" would randomly pick
+                            # forward_dynamics/inverse_dynamics/policy per sample (multi-task),
+                            # which dilutes each per-task loss by ~1/3.
                             mode="policy",
-                            camera_mode="concat_view",
-                            action_space="frame_wise_relative",
-                            rotation_space="6d",
-                            pose_coordinate_frame="native",
-                            action_normalization="quantile_rot",
-                            val_ratio=0.01,
-                            iterable_shuffle=True,
+                            use_state=True,
+                            iterable_shuffle=True,  # rank x worker episode-shuffle stream
                             episode_shuffle_seed=42,
-                            resolution=None,
+                            # SR boost: random crop+rescale + ColorJitter, applied CPU-side in the
+                            # DROIDLeRobotDataset image augmentor (matches i4's pipeline stage).
+                            use_image_augmentation=True,
+                            # keep_ranges_1_0_1.json window filter (drops idle/non-task frames). Off by default;
+                            # set use_filter_dict=True + filter_dict_path to enable.
+                            use_filter_dict=False,
+                            filter_dict_path=None,
+                            action_normalization=None,
+                            viewpoint="concat_view",  # wrist 480p (top) + L/R shoulder 320x180 (bottom)
+                            resolution="480",  # 640x360 data @ 480p
                             max_action_dim="${model.config.max_action_dim}",
                             cfg_dropout_rate=0.1,
-                            format_prompt_as_json=True,  # structured JSON prompts (set False for plain-text)
                             tokenizer_config="${model.config.vlm_config.tokenizer}",
+                            format_prompt_as_json=True,
+                            use_success_only=True,
                         ),
                     ),
                 ),
@@ -237,6 +246,6 @@ action_policy_libero_edge = LazyDict(
 )
 
 
-for _item in [action_policy_libero_edge]:
+for _item in [action_policy_droid_edge]:
     _name = [k for k, v in globals().items() if v is _item][0]
     cs.store(group="experiment", package="_global_", name=_name, node=_item)

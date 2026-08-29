@@ -32,10 +32,8 @@ cs = ConfigStore.instance()
 def _action_policy_robotwin_edge_model_config() -> dict:
     """RoboTwin model config on the Edge baseline: capped packed tokens,
     selective activation checkpointing, fresh diffusion-expert init. Keep
-    ``encode_exact_durations=[17, 61, 73]`` to match the Cosmos3 base, plus
-    121 for whole-episode samples that hit the max_episode_blocks=30 cap
-    (1 + 30*4 observation frames); shorter 4N+1 episodes fall back to the
-    VAE's padded chunked encode."""
+    ``encode_exact_durations=[17, 61, 73]`` to match the Cosmos3 base;
+    whole-episode 4N+1 lengths not in the list fall back to eager exact encode."""
     cfg = copy.deepcopy(EDGE_MODEL_CONFIG)  # action_gen=True, max_action_dim=64
     # Cap the packed sequence (same bound as the libero/nano action recipes;
     # uncapped packs one very long sequence and OOMs).
@@ -43,7 +41,7 @@ def _action_policy_robotwin_edge_model_config() -> dict:
     cfg["activation_checkpointing"]["mode"] = "selective"
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     # Edge baseline already sets rectified_flow loss_scale=10.0 / image_loss_scale=None.
-    cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73, 121]  # do NOT reduce; 121 = whole-episode cap
+    cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]
     return cfg
 
 
@@ -181,9 +179,7 @@ action_policy_robotwin_edge = LazyDict(
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_robotwin",
-            # peak-mem bound; whole-episode samples (up to 31 latent blocks, ~14k vision
-            # tokens each at the 640 tier) are ~7x larger than the old 17-frame chunks.
-            max_samples_per_batch=16,  # override via TOML for small-rank local runs
+            max_samples_per_batch=1,  # one unlimited whole-episode per micro-batch; override via TOML
             max_sequence_length=None,  # None disables token packing (TOML can't express null)
             patch_spatial=2,
             sound_latent_fps=0,
@@ -208,10 +204,10 @@ action_policy_robotwin_edge = LazyDict(
                             #   ROBOTWIN_ROOT=.../RoboTwin-LeRobot-v3.0/adjust_bottle/aloha-agilex_clean_50
                             root="${oc.env:ROBOTWIN_ROOT}",
                             fps=30.0,  # native 30 FPS grid (no temporal subsampling)
-                            # -1 = whole-episode mode: one sample per episode, all frames/actions
-                            # from frame 0, capped at max_episode_blocks latent blocks.
+                            # -1 = whole-episode: one sample per episode, all frames/actions
+                            # from frame 0, no length cap (4N+1 tail padding only).
                             chunk_length=-1,
-                            max_episode_blocks=30,  # cap: 1 + 30*4 = 121 observation frames (~4 s @ 30 fps)
+                            max_episode_blocks=-1,
                             action_space="joint_pos",  # 14D dual-arm joints+grippers (RoboTwin has no EE pose)
                             mode="policy",
                             use_state=True,  # prepend the 14D initial joint state

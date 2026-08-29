@@ -296,6 +296,7 @@ def get_action_libero_sft_dataset(
     root: str,
     fps: float = 20.0,
     chunk_length: int = 16,
+    max_episode_blocks: int = -1,
     image_size: int = 256,
     mode: str = "policy",
     camera_mode: str = "concat_view",
@@ -329,11 +330,18 @@ def get_action_libero_sft_dataset(
     ``root`` at libero_10 alone. The
     dataset is FPS-agnostic (decodes at real frame timestamps); ``fps`` is metadata
     for ``conditioning_fps`` / prompt duration.
+
+    ``chunk_length=-1`` selects whole-episode mode: one sample per episode,
+    fetched at the episode's exact length and rounded UP to ``4N + 1`` frames
+    with tail-frame / last-action padding. ``max_episode_blocks`` caps the
+    length at ``1 + max_episode_blocks * 4`` observation frames (``-1`` =
+    unlimited); it is ignored for positive ``chunk_length``.
     """
     dataset = LIBEROLeRobotDataset(
         root=root,
         image_size=image_size,
         chunk_length=chunk_length,
+        max_episode_blocks=max_episode_blocks,
         fps=fps,
         mode=mode,
         split=split,

@@ -52,6 +52,7 @@ _VIEWPOINT_BY_CAMERA = {
     "wrist_image": "wrist_view",
     "concat_view": "concat_view",
 }
+_VAE_TEMPORAL_COMPRESSION_FACTOR = 4
 
 
 class LIBEROLeRobotDataset(ActionBaseDataset):
@@ -62,6 +63,10 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
     against the bundled stats. Reads parquet + decodes video at real timestamps,
     so the requested ``fps`` is metadata only (it sets ``conditioning_fps`` and the
     prompt duration); frame windows always use the data's actual frames.
+
+    ``chunk_length=-1`` selects whole-episode mode: one sample per episode,
+    rounded UP to ``4N+1`` frames with tail-frame / last-action padding.
+    ``max_episode_blocks`` (``-1`` = unlimited) only applies in that mode.
     """
 
     def __init__(
@@ -83,6 +88,7 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         val_ratio: float = 0.01,
         seed: int = 0,
         sample_stride: int = 1,
+        max_episode_blocks: int = -1,
     ) -> None:
         if action_space != "frame_wise_relative":
             raise NotImplementedError(
@@ -93,8 +99,19 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         split = split.lower().strip()
         if split not in {"train", "val", "valid", "validation", "eval", "test", "full"}:
             raise ValueError(f"Unsupported split={split!r}. Use train/val/full.")
-        if chunk_length % 4 != 0:
-            raise ValueError(f"chunk_length must be divisible by 4, got {chunk_length}.")
+        if chunk_length == -1:
+            if max_episode_blocks != -1 and max_episode_blocks < 1:
+                raise ValueError(f"max_episode_blocks must be >= 1, or -1 for unlimited; got {max_episode_blocks}.")
+        else:
+            if chunk_length < 1 or chunk_length % 4 != 0:
+                raise ValueError(
+                    f"chunk_length must be divisible by 4, or -1 for whole-episode mode; got {chunk_length}."
+                )
+            if max_episode_blocks != -1:
+                log.warning(
+                    f"LIBEROLeRobotDataset: max_episode_blocks={max_episode_blocks} is ignored in "
+                    f"windowed mode (chunk_length={chunk_length}); it only applies when chunk_length == -1."
+                )
 
         super().__init__(
             root=root,
@@ -127,6 +144,8 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._pose_coordinate_frame = pose_coordinate_frame
         self._embodiment_type = embodiment_type
         self._requested_normalization = action_normalization
+        self._whole_episode = chunk_length == -1
+        self._max_episode_blocks = int(max_episode_blocks)
         # quantile_rot normalizes against the raw (un-orthonormalized) rotation stats
         # under "global_raw"; everything else uses "global".
         self._stats_key = "global_raw" if action_normalization == "quantile_rot" else "global"
@@ -167,12 +186,18 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         self._ep_vals = ep_vals.astype(np.int64)[kept]
         self._ep_starts = ep_starts.astype(np.int64)[kept]
         kept_counts = ep_counts.astype(np.int64)[kept]
-        # Within-episode windows only: total - n_kept_episodes * chunk_length valid samples.
-        self._valid_cum = np.cumsum(np.maximum(0, kept_counts - self._chunk_length)).astype(np.int64)
+        self._ep_counts = kept_counts
+        if self._whole_episode:
+            # One sample per episode with at least 2 frames (need one action step).
+            self._valid_cum = np.cumsum((kept_counts >= 2).astype(np.int64))
+        else:
+            # Within-episode windows only: total - n_kept_episodes * chunk_length valid samples.
+            self._valid_cum = np.cumsum(np.maximum(0, kept_counts - self._chunk_length)).astype(np.int64)
 
         log.info(
             f"Loaded LIBERO dataset root={self._root} split={split!r} camera_mode={camera_mode!r} "
-            f"fps={self._fps} kept_episodes={len(self._ep_vals)}/{len(ep_vals)} "
+            f"fps={self._fps} whole_episode={self._whole_episode} "
+            f"kept_episodes={len(self._ep_vals)}/{len(ep_vals)} "
             f"valid_indices={int(self._valid_cum[-1]) if self._valid_cum.size else 0}"
         )
 
@@ -273,19 +298,28 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
         idx = int(idx)
         ep = int(np.searchsorted(self._valid_cum, idx, side="right"))
         prev = int(self._valid_cum[ep - 1]) if ep > 0 else 0
-        start = int(self._ep_starts[ep]) + (idx - prev)
         episode_index = int(self._ep_vals[ep])
         episode = self._episodes[episode_index]
 
-        stop = start + self._chunk_length + 1
-        timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
-        video = self._load_video(episode, timestamps)
+        if self._whole_episode:
+            start = int(self._ep_starts[ep])
+            n = int(self._ep_counts[ep])
+            obs_idx, act_idx = self._whole_episode_obs_act_indices(start, n)
+            timestamps = [float(self._row_timestamp[j]) for j in obs_idx]
+            video = self._load_video(episode, timestamps)
+            raw = self._row_action[np.asarray(act_idx, dtype=np.int64)]
+            task_row = start
+        else:
+            start = int(self._ep_starts[ep]) + (idx - prev)
+            stop = start + self._chunk_length + 1
+            timestamps = [float(self._row_timestamp[j]) for j in range(start, stop)]
+            video = self._load_video(episode, timestamps)
+            raw = self._row_action[start : start + self._chunk_length]  # [chunk, 7]
+            task_row = start
 
-        # frame_wise_relative: chunk per-frame deltas are the stored actions directly.
-        raw = self._row_action[start : start + self._chunk_length]  # [chunk, 7]
         action = self._build_frame_wise_action(raw)
 
-        task = self._tasks[int(self._row_task[start])]
+        task = self._tasks[int(self._row_task[task_row])]
         ai_caption = random.choice([p.strip() for p in task.split(" | ") if p.strip()] or [task])
 
         extras: dict[str, Any] = {}
@@ -294,6 +328,27 @@ class LIBEROLeRobotDataset(ActionBaseDataset):
                 "The left half shows the third-person view; the right half shows the wrist-mounted camera."
             )
         return self._build_result(mode=mode, video=video, action=action, ai_caption=ai_caption, **extras)
+
+    def _whole_episode_obs_act_indices(self, start: int, n: int) -> tuple[list[int], list[int]]:
+        """Absolute row indices for one whole episode, rounded UP to ``4N+1``.
+
+        Caps at ``1 + 4 * max_episode_blocks`` frames when the cap is set (``-1``
+        = unlimited). Pads by repeating the last real row so the fetched video
+        and action tensors come back tail-padded.
+        """
+        if self._max_episode_blocks != -1:
+            n = min(n, 1 + self._max_episode_blocks * _VAE_TEMPORAL_COMPRESSION_FACTOR)
+        if n < 2:
+            raise ValueError(
+                f"LIBEROLeRobotDataset: whole-episode sample starting at row {start} has only "
+                f"{n} frames; need at least 2 (one action step)."
+            )
+        tcf = _VAE_TEMPORAL_COMPRESSION_FACTOR
+        target_t = (n - 1 + tcf - 1) // tcf * tcf + 1
+        last = start + n - 1
+        obs_idx = list(range(start, start + n)) + [last] * (target_t - n)
+        act_idx = obs_idx[: target_t - 1]
+        return obs_idx, act_idx
 
     def _build_frame_wise_action(self, raw: np.ndarray) -> torch.Tensor:
         raw_t = torch.from_numpy(np.ascontiguousarray(raw)).float()  # [chunk, 7]

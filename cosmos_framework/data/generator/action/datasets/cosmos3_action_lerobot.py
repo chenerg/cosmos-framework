@@ -845,24 +845,8 @@ class BaseActionLeRobotDataset(Dataset):
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support whole-episode fetching.")
 
-    def _whole_episode_rows(self, ds: LeRobotDataset, episode_id: int) -> tuple[list[int], list[int], int]:
-        """Build the absolute row indices covering one whole episode.
-
-        Subsamples the native-FPS rows down to ``self._fps`` (integer stride),
-        caps at ``1 + 4 * max_episode_blocks`` frames (no cap when -1), rounds
-        the frame count UP to ``4N + 1`` for the VAE, and pads by repeating the
-        last real row — so the fetched tensors come back tail-padded and no
-        ``*_is_pad`` post-processing is needed.
-
-        Returns:
-            ``(obs_rows, act_rows, n_real)`` where ``obs_rows`` has
-            ``target_t`` entries, ``act_rows = obs_rows[:target_t - 1]``, and
-            ``n_real`` is the un-padded (post-cap) frame count.
-        """
-        ep = ds.meta.episodes[episode_id]
-        start = int(ep["dataset_from_index"])
-        stop = int(ep["dataset_to_index"])
-
+    def _whole_episode_stride(self, ds: LeRobotDataset) -> int:
+        """Integer native/target FPS ratio used to subsample whole-episode rows."""
         native_fps = float(ds.meta.fps)
         stride_f = native_fps / self._fps
         stride = max(1, int(round(stride_f)))
@@ -870,8 +854,37 @@ class BaseActionLeRobotDataset(Dataset):
             f"{self.__class__.__name__}: whole-episode mode requires an integer native/target FPS "
             f"ratio, got native={native_fps} / target={self._fps} = {stride_f}"
         )
+        return stride
 
-        obs_rows = list(range(start, stop, stride))
+    @staticmethod
+    def _split_contiguous_row_runs(rows: list[int], stride: int) -> list[list[int]]:
+        """Split absolute row indices into contiguous runs of ``stride``.
+
+        Used so video decode can scan each kept interval sequentially instead of
+        one ``min(ts)..max(ts)`` pass that would also decode idle gaps.
+        """
+        if not rows:
+            return []
+        runs: list[list[int]] = [[rows[0]]]
+        for row in rows[1:]:
+            if row == runs[-1][-1] + stride:
+                runs[-1].append(row)
+            else:
+                runs.append([row])
+        return runs
+
+    @staticmethod
+    def _repeat_last_time(tensor: torch.Tensor, extra: int) -> torch.Tensor:
+        """Repeat ``tensor[0]``'s last time step ``extra`` times (dim 0)."""
+        if extra <= 0:
+            return tensor
+        last = tensor[-1:].repeat(extra, *([1] * (tensor.ndim - 1)))
+        return torch.cat([tensor, last], dim=0)
+
+    def _finalize_whole_episode_obs_rows(
+        self, obs_rows: list[int], episode_id: int
+    ) -> tuple[list[int], list[int], int]:
+        """Cap, require >= 2 frames, and 4N+1-pad by repeating the last row."""
         n = len(obs_rows)
         if self._max_episode_blocks != -1:
             n = min(n, 1 + self._max_episode_blocks * _VAE_TEMPORAL_COMPRESSION_FACTOR)
@@ -884,9 +897,31 @@ class BaseActionLeRobotDataset(Dataset):
 
         tcf = _VAE_TEMPORAL_COMPRESSION_FACTOR
         target_t = (n - 1 + tcf - 1) // tcf * tcf + 1  # round UP to 4N+1
-        obs_rows = obs_rows + [obs_rows[-1]] * (target_t - n)  # tail-row padding
+        obs_rows = obs_rows + [obs_rows[-1]] * (target_t - n)  # tail-row padding (tabular)
         act_rows = obs_rows[: target_t - 1]
         return obs_rows, act_rows, n
+
+    def _whole_episode_rows(self, ds: LeRobotDataset, episode_id: int) -> tuple[list[int], list[int], int]:
+        """Build the absolute row indices covering one whole episode.
+
+        Subsamples the native-FPS rows down to ``self._fps`` (integer stride),
+        caps at ``1 + 4 * max_episode_blocks`` frames (no cap when -1), rounds
+        the frame count UP to ``4N + 1`` for the VAE, and pads by repeating the
+        last real row — so tabular fetches come back tail-padded and no
+        ``*_is_pad`` post-processing is needed. Video decode uses only the
+        first ``n_real`` rows (see ``_fetch_whole_episode``).
+
+        Returns:
+            ``(obs_rows, act_rows, n_real)`` where ``obs_rows`` has
+            ``target_t`` entries, ``act_rows = obs_rows[:target_t - 1]``, and
+            ``n_real`` is the un-padded (post-cap) frame count.
+        """
+        ep = ds.meta.episodes[episode_id]
+        start = int(ep["dataset_from_index"])
+        stop = int(ep["dataset_to_index"])
+        stride = self._whole_episode_stride(ds)
+        obs_rows = list(range(start, stop, stride))
+        return self._finalize_whole_episode_obs_rows(obs_rows, episode_id)
 
     def _rows_to_timestamps(self, ds: LeRobotDataset, rows: list[int]) -> list[float]:
         """Episode-relative timestamps for the given absolute row indices.
@@ -904,14 +939,16 @@ class BaseActionLeRobotDataset(Dataset):
 
         Bypasses ``LeRobotDataset.__getitem__`` (fixed ``delta_timestamps``)
         and issues per-episode queries: tabular features via
-        ``_query_hf_dataset`` and camera frames via ``_query_videos``.  The
-        tail padding to ``4N + 1`` is realized at the row-index level (the
-        repeated last row / timestamp), so the returned tensors are already
-        exactly sized: obs-grid features have ``target_t`` rows, act-grid
-        features ``target_t - 1``.
+        ``_query_hf_dataset`` and camera frames via ``_query_videos``.
+
+        Tabular ``4N+1`` pad is the repeated last row in ``obs_rows``. Video is
+        decoded **per contiguous run** of the unpadded rows (so pyav does not
+        scan idle gaps between keep_ranges), then the last frame is repeated
+        in tensor space to ``target_t``.
         """
         ds._ensure_hf_dataset_loaded()
-        obs_rows, act_rows, _ = self._whole_episode_rows(ds, episode_id)
+        obs_rows, act_rows, n_real = self._whole_episode_rows(ds, episode_id)
+        target_t = len(obs_rows)
 
         query_indices: dict[str, list[int]] = {
             feature: (obs_rows if grid == "obs" else act_rows)
@@ -926,9 +963,22 @@ class BaseActionLeRobotDataset(Dataset):
         if not self._skip_video_loading:
             camera_keys = self._whole_episode_camera_features()
             if camera_keys:
-                query_ts = self._rows_to_timestamps(ds, obs_rows)
-                video_frames = ds._query_videos({key: query_ts for key in camera_keys}, episode_id)
-                sample.update(video_frames)
+                stride = self._whole_episode_stride(ds)
+                runs = self._split_contiguous_row_runs(obs_rows[:n_real], stride)
+                per_cam: dict[str, list[torch.Tensor]] = {key: [] for key in camera_keys}
+                for run in runs:
+                    query_ts = self._rows_to_timestamps(ds, run)
+                    chunk = ds._query_videos({key: query_ts for key in camera_keys}, episode_id)
+                    for key in camera_keys:
+                        frames = chunk[key]
+                        # lerobot squeeze(0) drops T when a run is a single frame
+                        if frames.ndim == 3:
+                            frames = frames.unsqueeze(0)
+                        per_cam[key].append(frames)
+                extra = target_t - n_real
+                for key in camera_keys:
+                    video = torch.cat(per_cam[key], dim=0) if len(per_cam[key]) > 1 else per_cam[key][0]
+                    sample[key] = self._repeat_last_time(video, extra)
 
         return sample
 

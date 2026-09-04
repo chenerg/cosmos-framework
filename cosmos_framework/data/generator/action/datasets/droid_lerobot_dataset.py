@@ -46,6 +46,34 @@ from cosmos_framework.data.generator.action.viewpoint_utils import Viewpoint
 from cosmos_framework.utils import log
 
 _FILTER_DICT_PATH = "/scratch/fsw/portfolios/cosmos/projects/cosmos_base_training/users/haolia/workspace/droid_oss_inputs/keep_ranges_1_0_1.json"
+_DROID_GCS_PREFIX = "gs://xembodiment_data/r2d2/r2d2-data-full/"
+
+
+def droid_keep_ranges_gcs_key(ep_id: str) -> str:
+    """KarlP/droid keep_ranges key for a LeRobot ``episode_id``."""
+    return (
+        f"{_DROID_GCS_PREFIX}{ep_id}/recordings/MP4--"
+        f"{_DROID_GCS_PREFIX}{ep_id}/trajectory.h5"
+    )
+
+
+def droid_keep_ranges_episode_id(key: str) -> str:
+    """Parse ``episode_id`` from a GCS keep_ranges key; pass through short ids."""
+    if key.startswith(_DROID_GCS_PREFIX):
+        return key[len(_DROID_GCS_PREFIX) :].split("/recordings/", 1)[0]
+    return key
+
+
+def clip_droid_keep_ranges(ranges: list, length: int) -> list[list[int]]:
+    """Clip ``[start, end)`` pairs to ``[0, length)`` and drop empty intervals."""
+    clipped: list[list[int]] = []
+    for pair in ranges:
+        start, end = int(pair[0]), int(pair[1])
+        lo, hi = max(start, 0), min(end, length)
+        if hi > lo:
+            clipped.append([lo, hi])
+    return clipped
+
 
 # 90-degree clockwise rotation about the Z axis (in local frame), converting
 # DROID Franka panda_link8 orientation to the OpenCV camera convention.
@@ -97,8 +125,6 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                     f"Whole-episode mode (chunk_length=-1) only supports action_space='joint_pos', "
                     f"got {action_space!r}."
                 )
-            if use_filter_dict:
-                raise ValueError("Whole-episode mode (chunk_length=-1) does not support use_filter_dict.")
             if max_num_history_actions > 0:
                 raise ValueError("Whole-episode mode (chunk_length=-1) does not support max_num_history_actions.")
             if split == "val_temp_seg":
@@ -129,6 +155,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         self._use_state = use_state
         self._use_filter_dict = use_filter_dict
         self._filter_dict_path = filter_dict_path or _FILTER_DICT_PATH
+        self._keep_ranges_by_episode: dict[str, list[list[int]]] = {}
         self._max_num_history_actions = max_num_history_actions
         self._use_image_augmentation = use_image_augmentation
         if max_num_history_actions > 0 and action_space not in ("midtrain", "joint_pos"):
@@ -204,6 +231,13 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         # LeRobotDataset video readers stay lazy behind the LRU in _get_dataset.
         self._register_sources()
 
+    def _lookup_filter_ranges(self, ep_id_str: str) -> list | None:
+        """Resolve keep_ranges for an episode (short id or KarlP GCS key)."""
+        ranges = self._filter_dict.get(ep_id_str)
+        if ranges is None:
+            ranges = self._filter_dict.get(droid_keep_ranges_gcs_key(ep_id_str))
+        return ranges
+
     def _append_index_records(self, *, meta, ds_idx: int, dataset_label: str | None = None) -> None:
         """ """
         if not self._use_filter_dict:
@@ -217,19 +251,48 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             split=self._split,
         )
         episode_spans, _, sample_count = build_episode_spans(
-            meta.episodes, episode_ids, self._chunk_length, sample_stride=self._sample_stride
+            meta.episodes,
+            episode_ids,
+            self._chunk_length,
+            sample_stride=self._sample_stride,
+            whole_episode=self._whole_episode,
         )
 
         class_name = self.__class__.__name__
-        label = f" [{dataset_label}]"
+        label = f" [{dataset_label}]" if dataset_label else ""
 
         log.info(f"{class_name}{label}: split={self._split}, num episodes={len(episode_ids)}")
+
+        if self._whole_episode:
+            kept_eps = 0
+            kept_frames = 0
+            for episode_id, sample_start, _valid_len in episode_spans:
+                ep = meta.episodes[episode_id]
+                ep_id_str = ep["episode_id"]
+                length = int(ep["length"])
+                ranges = self._lookup_filter_ranges(ep_id_str)
+                if not ranges:
+                    continue
+                clipped = clip_droid_keep_ranges(ranges, length)
+                concat_len = sum(end - start for start, end in clipped)
+                if concat_len < 2:
+                    continue
+                self._keep_ranges_by_episode[ep_id_str] = clipped
+                self._episode_records.append((ds_idx, sample_start, 1, episode_id))
+                self._num_valid_indices += 1
+                self._episode_cum_ends.append(self._num_valid_indices)
+                kept_eps += 1
+                kept_frames += concat_len
+            log.info(
+                f"{class_name}{label}: keep_ranges concat kept {kept_eps} episodes / "
+                f"{kept_frames} frames (dropped empty or <2-frame after clip)"
+            )
+            return
 
         filtered_count = 0
         for episode_id, sample_start, valid_len in episode_spans:
             ep_id_str = meta.episodes[episode_id]["episode_id"]
-            episode_key = f"gs://xembodiment_data/r2d2/r2d2-data-full/{ep_id_str}/recordings/MP4--gs://xembodiment_data/r2d2/r2d2-data-full/{ep_id_str}/trajectory.h5"
-            ranges = self._filter_dict.get(episode_key)
+            ranges = self._lookup_filter_ranges(ep_id_str)
             if ranges is None:
                 continue
             for s, e in ranges:
@@ -361,6 +424,20 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         if self._action_space == "joint_pos":
             return build_action_spec(Joint(n=7, label="joint"), Gripper())
         return build_action_spec(Pos(), Rot("rot6d"), Gripper())
+
+    def _whole_episode_rows(self, ds, episode_id: int):
+        """Concat keep_ranges intervals (when set) then stride / cap / 4N+1-pad."""
+        ep = ds.meta.episodes[episode_id]
+        ranges = self._keep_ranges_by_episode.get(ep["episode_id"])
+        if not ranges:
+            return super()._whole_episode_rows(ds, episode_id)
+        start = int(ep["dataset_from_index"])
+        native: list[int] = []
+        for seg_start, seg_end in ranges:
+            native.extend(range(start + seg_start, start + seg_end))
+        stride = self._whole_episode_stride(ds)
+        obs_rows = native[::stride]
+        return self._finalize_whole_episode_obs_rows(obs_rows, episode_id)
 
     def _whole_episode_tabular_grids(self) -> dict[str, str]:
         """Whole-episode tabular features (``joint_pos`` only, enforced in __init__)."""

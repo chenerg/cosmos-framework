@@ -222,8 +222,10 @@ action_policy_droid_edge = LazyDict(
                             # SR boost: random crop+rescale + ColorJitter, applied CPU-side in the
                             # DROIDLeRobotDataset image augmentor (matches i4's pipeline stage).
                             use_image_augmentation=True,
-                            # keep_ranges_1_0_1.json window filter (drops idle/non-task frames). Off by default;
-                            # set use_filter_dict=True + filter_dict_path to enable.
+                            # keep_ranges filter. Off by default (no JSON required). When True in
+                            # whole-episode mode, each original episode's valid [start,end) segments
+                            # are concatenated into one sample (empty / <2-frame dropped at index
+                            # build). Windowed mode still keeps per-range sliding windows.
                             use_filter_dict=False,
                             filter_dict_path=None,
                             action_normalization=None,

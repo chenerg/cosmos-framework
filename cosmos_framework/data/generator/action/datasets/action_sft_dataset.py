@@ -124,7 +124,10 @@ def get_action_droid_sft_dataset(
     fetched at the episode's exact length, rounded UP to ``4N + 1`` frames
     with tail-frame / last-action padding.  ``max_episode_blocks`` caps the
     length at ``1 + max_episode_blocks * 4`` observation frames (``-1`` =
-    unlimited); it only applies in whole-episode mode.
+    unlimited); it only applies in whole-episode mode.  With
+    ``use_filter_dict=True``, each episode's keep_ranges segments are
+    concatenated into that one sample (empty / missing / ``<2``-frame
+    episodes are dropped when the index is built).
 
     Reads ``root`` (a merged/versioned DROID LeRobot root) as a single flat
     dataset; ``use_success_only=True`` filters to the ``success/`` split."""

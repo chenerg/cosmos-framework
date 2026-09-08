@@ -846,13 +846,14 @@ class ActionModelService:
 
         Runs the same ``ActionPromptJsonFormatter`` the training pipeline uses (after
         spatial resize/pad), then ``json.dumps`` the dict exactly as
-        ``TextTokenizerTransform`` does before tokenization. ``idle_frames=0`` matches the
+        ``TextTokenizerTransform`` does before tokenization. ``mode=policy`` omits
+        clip ``duration`` / action ``time``. ``idle_frames=0`` matches the
         modal active-manipulation chunk (the policy should keep moving); ``viewpoint`` and
         the zero ``action`` (total-frame count) mirror the LIBERO concat_view dataset."""
         data_dict: dict[str, Any] = {
             "ai_caption": prompt,
             "viewpoint": _LIBERO_JSON_VIEWPOINT,
-            "video": video,  # post-pad [C,T,H,W]; formatter reads T for duration
+            "video": video,  # post-pad [C,T,H,W]
             "image_size": image_size,  # post-pad [H,W]; formatter reads resolution
             "conditioning_fps": torch.tensor(self.cfg.fps, dtype=torch.long),
             "mode": "policy",

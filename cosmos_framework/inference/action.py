@@ -58,6 +58,7 @@ def _format_prompt(
     action: torch.Tensor,
     fps: torch.Tensor,
     image_size: torch.Tensor,
+    mode: str | None = None,
 ) -> str:
     """Helper function to build the action prompt with optional duration and resolution info."""
     data_dict = {
@@ -68,6 +69,8 @@ def _format_prompt(
         "conditioning_fps": fps,
         "image_size": image_size,
     }
+    if mode is not None:
+        data_dict["mode"] = mode
     prompt_json_formatter = ActionPromptJsonFormatter()
     ai_caption = prompt_json_formatter(data_dict)[prompt_json_formatter.caption_key]
     if isinstance(ai_caption, dict):
@@ -124,6 +127,7 @@ def build_action_batch(
         action=action,
         fps=torch.tensor(fps, dtype=torch.long),
         image_size=padded_image_size,
+        mode=model_mode.value,
     )
 
     action_processing_record = ActionProcessingRecord(

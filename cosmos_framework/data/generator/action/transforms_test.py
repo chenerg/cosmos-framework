@@ -129,6 +129,30 @@ def test_action_prompt_json_formatter_drops_empty_viewpoint() -> None:
 
 
 @pytest.mark.L0
+def test_action_prompt_json_formatter_omits_clip_timeline_for_policy() -> None:
+    formatter = ActionPromptJsonFormatter()
+    video = torch.zeros(3, 385, 544, 736)  # [C,T,H,W]  — whole-episode 96-block cap
+    action = torch.zeros(385, 8)  # [T,D]
+    data_dict = {
+        "ai_caption": "Pick up the cup.",
+        "video": video,
+        "action": action,
+        "conditioning_fps": torch.tensor(15.0),
+        "image_size": torch.tensor([544, 736, 540, 640]),
+        "viewpoint": "concat_view",
+        "mode": "policy",
+    }
+
+    prompt = formatter(data_dict)["ai_caption"]
+
+    assert "duration" not in prompt
+    assert "time" not in prompt["actions"][0]
+    assert prompt["actions"][0]["description"] == "Pick up the cup."
+    assert prompt["fps"] == 15.0
+    assert prompt["resolution"] == {"H": 544, "W": 736}
+
+
+@pytest.mark.L0
 def test_action_transform_pipeline_json_prompt_toggle() -> None:
     pipeline = ActionTransformPipeline(
         tokenizer_config=None,
@@ -152,19 +176,19 @@ def test_action_transform_pipeline_json_prompt_toggle() -> None:
 
     prompt = result["ai_caption"]
     assert isinstance(prompt, dict)
-    assert list(prompt.keys()) == ["cinematography", "actions", "duration", "fps", "resolution", "aspect_ratio"]
-    assert list(prompt["actions"][0].keys()) == ["time", "description", "idle_frame"]
+    # Policy UND must not leak clip length (duration / action time range).
+    assert list(prompt.keys()) == ["cinematography", "actions", "fps", "resolution", "aspect_ratio"]
+    assert list(prompt["actions"][0].keys()) == ["description", "idle_frame"]
     assert prompt["cinematography"] == {
         "framing": "This video is captured from a third-person perspective looking towards the agent from the front."
     }
     assert prompt["actions"] == [
         {
-            "time": "0:00-0:02",
             "description": "Open the drawer.",
             "idle_frame": "3 out of 16.",
         }
     ]
-    assert prompt["duration"] == "2s"
+    assert "duration" not in prompt
     assert prompt["fps"] == 8.0
     assert prompt["resolution"] == {"H": 192, "W": 320}
     assert prompt["aspect_ratio"] == "16,9"
@@ -289,6 +313,7 @@ def test_action_transform_pipeline_skips_idle_frames_for_inverse_dynamics_json_p
             "description": "Open the drawer.",
         }
     ]
+    assert prompt["duration"] == "2s"
     assert result["action"].shape == (16, 4)
 
 

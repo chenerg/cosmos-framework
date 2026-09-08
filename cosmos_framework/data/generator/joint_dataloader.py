@@ -179,6 +179,7 @@ class JointDataLoader(webdataset.WebLoader):
         lookahead_limits: Dict[str, int] | None = None,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        recycle_inner_iterator: bool = False,
     ):
         """
         Initialize the JointDataLoader with multiple datasets.
@@ -229,6 +230,7 @@ class JointDataLoader(webdataset.WebLoader):
         self.default_lookahead_limit = int(default_lookahead_limit)
         self.uniae_pad_frames = int(uniae_pad_frames) if uniae_pad_frames is not None else None
         self.uniae_chunk_frames = self._normalize_uniae_chunk_frames(uniae_chunk_frames)
+        self.recycle_inner_iterator = bool(recycle_inner_iterator)
 
         assert (self.max_sequence_length is None) != (self.max_samples_per_batch is None), (
             "Exactly one of max_sequence_length or max_samples_per_batch must be None, but not both."
@@ -541,7 +543,15 @@ class JointDataLoader(webdataset.WebLoader):
             try:
                 batch = next(self.dataloaders[index_id])
             except StopIteration:
-                raise
+                if not self.recycle_inner_iterator:
+                    raise
+                name = self.dataset_name_list[index_id]
+                log.info(
+                    f"JointDataLoader: recycling exhausted iterator for {name!r}",
+                    rank0_only=False,
+                )
+                self.dataloaders[index_id] = iter(self.dataloader_list[index_id])
+                batch = next(self.dataloaders[index_id])
 
             is_image_batch = "images" in batch
             input_images_or_videos = batch["images" if is_image_batch else "video"]
@@ -873,6 +883,7 @@ class PackingDataLoader(JointDataLoader):
         lookahead_limit: int = JointDataLoader._DEFAULT_LOOKAHEAD_LIMIT,
         uniae_chunk_frames: int | Mapping[str, int] | None = None,
         uniae_pad_frames: int | None = None,
+        recycle_inner_iterator: bool = False,
     ):
         """
         Args:
@@ -904,6 +915,7 @@ class PackingDataLoader(JointDataLoader):
             lookahead_limits={dataset_name: int(lookahead_limit)},
             uniae_chunk_frames=uniae_chunk_frames,
             uniae_pad_frames=uniae_pad_frames,
+            recycle_inner_iterator=recycle_inner_iterator,
         )
 
     def __iter__(self):

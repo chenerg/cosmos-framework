@@ -32,14 +32,11 @@ cs = ConfigStore.instance()
 
 
 def _action_policy_droid_edge_model_config() -> dict:
-    """DROID model config on the Edge baseline: capped packed tokens, selective
-    activation checkpointing, fresh diffusion-expert init. Keep
+    """DROID model config on the Edge baseline: selective activation
+    checkpointing, fresh diffusion-expert init. Keep
     ``encode_exact_durations=[17, 61, 73]`` as VAE warmup shapes; whole-episode
     4N+1 lengths not in the list fall back to eager exact encode."""
     cfg = copy.deepcopy(EDGE_MODEL_CONFIG)  # action_gen=True, max_action_dim=64
-    # Cap the packed sequence (same bound as the other Edge action recipes;
-    # the nano DROID recipe uncaps to -1, which OOMs on a single NPU).
-    cfg["max_num_tokens_after_packing"] = 74000
     cfg["activation_checkpointing"]["mode"] = "selective"
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     # Edge baseline already sets rectified_flow loss_scale=10.0 / image_loss_scale=None.
@@ -182,7 +179,12 @@ action_policy_droid_edge = LazyDict(
             audio_sample_rate=48000,
             dataset_name="action_droid",
             max_samples_per_batch=1,  # one whole episode per micro-batch; override via TOML
-            max_sequence_length=None,  # None disables token packing (TOML can't express null)
+            # Pre-expansion token cap (UND+vis+action). Index drop uses
+            # max_pre_tf_tokens=48000 (~477 frames at 480p with extra=500).
+            # Keep packing lookahead tiny so a near-full batch does not
+            # buffer extra decoded whole-episode videos (default is 10).
+            max_sequence_length=None,
+            lookahead_limit=1,
             patch_spatial=2,
             sound_latent_fps=0,
             tokenizer_spatial_compression_factor=16,
@@ -193,7 +195,7 @@ action_policy_droid_edge = LazyDict(
                 num_workers=4,
                 persistent_workers=True,
                 pin_memory=True,
-                prefetch_factor=4,
+                prefetch_factor=2,  # 4 held ~1 TiB of whole-episode RGB in workers
                 sampler=None,
                 # Shuffling is handled by the dataset (iterable_shuffle=True below):
                 # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-
@@ -211,6 +213,11 @@ action_policy_droid_edge = LazyDict(
                             # no max_episode_blocks cap (4N+1 tail padding only).
                             chunk_length=-1,
                             max_episode_blocks=-1,
+                            # Drop (do not truncate) episodes whose 4N+1 padded
+                            # length would exceed the 8-card 480p HBM budget
+                            # (~477 frames / 48000 pre-TF tokens, extra=500).
+                            # Index-only; workers never decode the dropped videos.
+                            max_pre_tf_tokens=48000,
                             action_space="joint_pos",
                             # Policy-only task mode. "joint" would randomly pick
                             # forward_dynamics/inverse_dynamics/policy per sample (multi-task),
@@ -231,6 +238,10 @@ action_policy_droid_edge = LazyDict(
                             action_normalization=None,
                             viewpoint="concat_view",  # wrist 480p (top) + L/R shoulder 320x180 (bottom)
                             resolution="480",  # 640x360 data @ 480p
+                            # Close torchcodec/FFmpeg after each episode. Packed-mp4 AV1
+                            # decoder state is large; a 64-slot LRU does not help unique
+                            # whole-episode streams and dominates host RSS.
+                            video_decoder_cache_size=0,
                             max_action_dim="${model.config.max_action_dim}",
                             cfg_dropout_rate=0.1,
                             tokenizer_config="${model.config.vlm_config.tokenizer}",

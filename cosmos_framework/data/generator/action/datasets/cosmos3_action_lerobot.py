@@ -12,6 +12,7 @@ These helpers centralize common behavior across Action wrappers:
 
 from __future__ import annotations
 
+import gc
 import importlib
 import logging as _logging
 import math
@@ -24,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import huggingface_hub.constants as _hf_const
@@ -118,91 +120,320 @@ _ACTION_NORMALIZATION_CHOICES: tuple[str, ...] = ("quantile", "quantile_rot", "m
 # mode sizes its cap in these blocks and rounds T up to ``4N + 1``.
 _VAE_TEMPORAL_COMPRESSION_FACTOR: int = 4
 
+# PackingDataLoader pre-TF extras for a policy sample: tokenizer text + eos +
+# vision_start/end. JSON prompts vary; 500 leaves slack so a long caption does
+# not push a just-under-budget episode over max_sequence_length after decode.
+_PRE_TF_EXTRA_TOKENS: int = 500
+
+
+def round_up_4n1(n: int) -> int:
+    """Round a positive frame count UP to the next Wan VAE ``4N + 1`` length."""
+    if n < 1:
+        return 0
+    tcf = _VAE_TEMPORAL_COMPRESSION_FACTOR
+    return (n - 1 + tcf - 1) // tcf * tcf + 1
+
+
+def max_frames_for_pre_tf_sequence_length(
+    max_sequence_length: int,
+    *,
+    spatial_tokens_per_latent: int,
+    extra_tokens: int = _PRE_TF_EXTRA_TOKENS,
+) -> int:
+    """Largest ``4N+1`` frame count whose pre-teacher-forcing packing tokens stay
+    strictly below ``max_sequence_length``.
+
+    Packing counts ``extra + T_lat * K + F`` with ``T_lat = 1 + (F-1)/4`` and
+    ``F = 4N+1``. ``PackingDataLoader`` discards when ``tokens >= max_sequence_length``.
+    """
+    if max_sequence_length < 1:
+        raise ValueError(f"max_sequence_length must be >= 1, got {max_sequence_length}")
+    if spatial_tokens_per_latent < 1:
+        raise ValueError(f"spatial_tokens_per_latent must be >= 1, got {spatial_tokens_per_latent}")
+    k = spatial_tokens_per_latent
+    # tokens = extra + K + N*(K+4)  < max_sequence_length
+    numer = max_sequence_length - k - extra_tokens
+    denom = k + _VAE_TEMPORAL_COMPRESSION_FACTOR
+    n_blocks = (numer - 1) // denom if numer > 0 else -1
+    if n_blocks < 0:
+        return 0
+    return 1 + n_blocks * _VAE_TEMPORAL_COMPRESSION_FACTOR
+
 _decoder_cache_patched = False
+_decoder_cache_settings: tuple[int, str] | None = None
+_orig_decode_torchcodec: Callable[..., Any] | None = None
+_malloc_trim_fn: Any = None
+
+
+def _malloc_trim() -> None:
+    """Ask glibc to munmap free arenas. ``free()`` / ``gc.collect()`` do not."""
+    global _malloc_trim_fn
+    if _malloc_trim_fn is False:
+        return
+    try:
+        if _malloc_trim_fn is None:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+            _malloc_trim_fn = libc.malloc_trim
+        _malloc_trim_fn(0)
+    except Exception:
+        _malloc_trim_fn = False
+
+
+def _release_decoder(decoder: Any, file_handle: Any) -> None:
+    """Drop the native decoder before closing any file-like, then collect.
+
+    torchcodec holds FFmpeg state on the decoder object. Closing the AVIO
+    file-like first can leave native buffers pinned; ``close``/``del`` then
+    ``gc.collect()`` is the teardown order that actually releases them.
+    PyAV containers expose ``close()`` and must be closed explicitly.
+    ``malloc_trim(0)`` is required for RSS to fall: glibc otherwise keeps
+    large FFmpeg/dav1d ``mmap`` arenas on the worker.
+    """
+    close = getattr(decoder, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+    try:
+        del decoder
+    except Exception:
+        pass
+    if file_handle is not None:
+        try:
+            file_handle.close()
+        except Exception:
+            pass
+    gc.collect()
+    _malloc_trim()
+
+
+class _PyAVIndexDecoder:
+    """Decode packed-mp4 frames by integer index with PyAV, then ``close()``.
+
+    Whole-episode fetch cannot use LeRobot's timestamp ``VideoReader`` path:
+    that can seek across the rest of a concatenated file. This wrapper seeks
+    to the first requested index, collects ``[T,C,H,W]`` uint8, and drops the
+    ``av.container`` on ``close()`` so libav / libdav1d state is not cached
+    the way torchcodec ``VideoDecoder`` is.
+    """
+
+    def __init__(self, video_path: str) -> None:
+        import av
+
+        self._path = str(video_path)
+        self._container = av.open(self._path)
+        self._stream = self._container.streams.video[0]
+        # Single-thread decode: SLICE/AUTO worker pools keep glibc arenas
+        # after container.close(). Set before the first decode.
+        try:
+            self._stream.thread_type = "NONE"
+            self._stream.codec_context.thread_count = 1
+        except Exception:
+            pass
+        rate = self._stream.average_rate or self._stream.base_rate
+        if rate is None or float(rate) <= 0:
+            raise RuntimeError(f"pyav could not determine fps for {self._path}")
+        self._fps = float(rate)
+        self._time_base = self._stream.time_base
+
+    def get_frames_at(self, indices: list[int]) -> SimpleNamespace:
+        if not indices:
+            raise ValueError(f"empty frame indices for {self._path}")
+        if self._container is None:
+            raise RuntimeError(f"pyav decoder already closed: {self._path}")
+        wanted = list(indices)
+        wanted_set = set(wanted)
+        first, last = min(wanted), max(wanted)
+        collected: dict[int, torch.Tensor] = {}
+        pts = int(first / self._fps / float(self._time_base))
+        self._container.seek(pts, stream=self._stream, backward=True, any_frame=False)
+        slack = max(int(round(self._fps)), 1)
+        for frame in self._container.decode(self._stream):
+            if frame.pts is None:
+                continue
+            idx = int(round(float(frame.pts * self._time_base) * self._fps))
+            if idx < first:
+                continue
+            if idx > last + slack:
+                break
+            if idx in wanted_set and idx not in collected:
+                arr = frame.to_ndarray(format="rgb24")  # H,W,C uint8, ffmpeg-owned
+                collected[idx] = torch.from_numpy(np.copy(arr)).permute(2, 0, 1)  # C,H,W
+                del arr, frame
+                if len(collected) == len(wanted_set):
+                    break
+        missing = [i for i in wanted if i not in collected]
+        if missing:
+            raise RuntimeError(
+                f"pyav missed {len(missing)}/{len(wanted)} frame indices from {self._path}; "
+                f"first missing={missing[0]} requested=[{first}, {last}]"
+            )
+        data = torch.stack([collected[i] for i in wanted], dim=0)  # T,C,H,W
+        return SimpleNamespace(data=data)
+
+    def close(self) -> None:
+        container = self._container
+        stream = self._stream
+        self._container = None
+        self._stream = None
+        if stream is not None:
+            try:
+                ctx = getattr(stream, "codec_context", None)
+                flush = getattr(ctx, "flush_buffers", None)
+                if callable(flush):
+                    flush()
+            except Exception:
+                pass
+        del stream
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
 
 
 class _LRUVideoDecoderCache:
-    """Drop-in replacement for ``lerobot.datasets.video_utils.VideoDecoderCache``
-    with LRU eviction.  When the cache exceeds *max_size* entries the
-    least-recently-used decoder (and its file handle) is evicted.
+    """Drop-in replacement for ``lerobot.datasets.video_utils.VideoDecoderCache``.
+
+    ``max_size==0``: do not cache concatenated mp4 decoders; decode then
+    release. ``open_mode="path"`` constructs ``VideoDecoder(path)`` so
+    torchcodec mmap's the file instead of an fsspec AVIO callback.
     """
 
-    def __init__(self, max_size: int = _LRU_VIDEO_CACHE_MAX_SIZE) -> None:
-        self._max_size = max_size
+    def __init__(
+        self,
+        max_size: int = _LRU_VIDEO_CACHE_MAX_SIZE,
+        open_mode: str = "fsspec",
+    ) -> None:
+        if max_size < 0:
+            raise ValueError(f"max_size must be >= 0, got {max_size}")
+        if open_mode not in ("fsspec", "path"):
+            raise ValueError(f"open_mode must be 'fsspec' or 'path', got {open_mode!r}")
+        self.max_size = max_size
+        self.open_mode = open_mode
         self._cache: OrderedDict[str, tuple[Any, Any]] = OrderedDict()
         self._lock = Lock()
         self._hits = 0
         self._misses = 0
         self._evictions = 0
 
-    def get_decoder(self, video_path: str) -> Any:
-        if importlib.util.find_spec("torchcodec"):  # type: ignore[attr-defined]
-            from torchcodec.decoders import VideoDecoder
-        else:
+    def open_fresh(self, video_path: str) -> tuple[Any, Any]:
+        if importlib.util.find_spec("torchcodec") is None:  # type: ignore[attr-defined]
             raise ImportError("torchcodec is required but not available.")
-
-        import fsspec
+        from torchcodec.decoders import VideoDecoder
 
         video_path = str(video_path)
+        if self.open_mode == "path":
+            decoder = VideoDecoder(video_path, seek_mode="approximate")
+            return decoder, None
+        import fsspec
 
+        file_handle = fsspec.open(video_path).__enter__()
+        decoder = VideoDecoder(file_handle, seek_mode="approximate")  # type: ignore[arg-type]
+        return decoder, file_handle
+
+    def get_decoder(self, video_path: str) -> Any:
+        video_path = str(video_path)
         with self._lock:
-            if video_path in self._cache:
+            if self.max_size > 0 and video_path in self._cache:
                 self._cache.move_to_end(video_path)
                 self._hits += 1
                 return self._cache[video_path][0]
 
             self._misses += 1
-            file_handle = fsspec.open(video_path).__enter__()
-            decoder = VideoDecoder(file_handle, seek_mode="approximate")  # type: ignore[arg-type]
+            decoder, file_handle = self.open_fresh(video_path)
+            if self.max_size == 0:
+                # Caller (the decode wrapper) must release; caching is disabled.
+                return decoder
             self._cache[video_path] = (decoder, file_handle)
-
             evicted = 0
-            while len(self._cache) > self._max_size:
-                _, (_, old_fh) = self._cache.popitem(last=False)
-                try:
-                    old_fh.close()
-                except Exception:
-                    pass
+            while len(self._cache) > self.max_size:
+                _, (old_dec, old_fh) = self._cache.popitem(last=False)
+                _release_decoder(old_dec, old_fh)
                 evicted += 1
             self._evictions += evicted
-
-            if evicted and self._evictions % 50 <= evicted:
-                log.debug(
-                    f"[VideoDecoderCache pid={_os.getpid()}] "
-                    f"evicted={self._evictions} total, size={len(self._cache)}/{self._max_size}, "
-                    f"hits={self._hits}, misses={self._misses}, "
-                    f"hit_rate={100 * self._hits / max(1, self._hits + self._misses):.1f}%"
-                )
-
             return decoder
 
     def clear(self) -> None:
         with self._lock:
-            for _, file_handle in self._cache.values():
-                try:
-                    file_handle.close()
-                except Exception:
-                    pass
+            items = list(self._cache.values())
             self._cache.clear()
+        for decoder, file_handle in items:
+            _release_decoder(decoder, file_handle)
 
     def size(self) -> int:
         with self._lock:
             return len(self._cache)
 
 
-def _patch_decoder_cache(max_size: int = _LRU_VIDEO_CACHE_MAX_SIZE) -> None:
-    """Replace the module-level ``_default_decoder_cache`` in LeRobot with an
-    LRU-capped version to prevent unbounded memory growth in workers."""
-    global _decoder_cache_patched
-    if _decoder_cache_patched:
-        return
+def _wrap_decode_torchcodec(cache: _LRUVideoDecoderCache) -> Callable[..., Any]:
+    """When ``max_size==0``, decode then drop the decoder (no 64-slot LRU)."""
+
+    def wrapped(
+        video_path: Path | str,
+        timestamps: list[float],
+        tolerance_s: float,
+        log_loaded_timestamps: bool = False,
+        decoder_cache: Any = None,
+    ) -> Any:
+        assert _orig_decode_torchcodec is not None
+        if cache.max_size == 0:
+            decoder, file_handle = cache.open_fresh(str(video_path))
+
+            class _OneShot:
+                def get_decoder(self, _path: str) -> Any:
+                    return decoder
+
+            try:
+                return _orig_decode_torchcodec(
+                    video_path,
+                    timestamps,
+                    tolerance_s,
+                    log_loaded_timestamps,
+                    decoder_cache=_OneShot(),
+                )
+            finally:
+                _release_decoder(decoder, file_handle)
+        return _orig_decode_torchcodec(
+            video_path,
+            timestamps,
+            tolerance_s,
+            log_loaded_timestamps,
+            decoder_cache=decoder_cache if decoder_cache is not None else cache,
+        )
+
+    return wrapped
+
+
+def _patch_decoder_cache(
+    max_size: int = _LRU_VIDEO_CACHE_MAX_SIZE,
+    open_mode: str = "fsspec",
+) -> None:
+    """Replace LeRobot's decoder cache / torchcodec decode entry point."""
+    global _decoder_cache_patched, _decoder_cache_settings, _orig_decode_torchcodec
 
     import lerobot.datasets.video_utils as _vu
 
-    lru_cache = _LRUVideoDecoderCache(max_size=max_size)
-    _vu._default_decoder_cache = lru_cache
+    settings = (int(max_size), str(open_mode))
+    if _decoder_cache_patched and _decoder_cache_settings == settings:
+        return
+    if _orig_decode_torchcodec is None:
+        _orig_decode_torchcodec = _vu.decode_video_frames_torchcodec
+
+    cache = _LRUVideoDecoderCache(max_size=max_size, open_mode=open_mode)
+    _vu._default_decoder_cache = cache
+    _vu.decode_video_frames_torchcodec = _wrap_decode_torchcodec(cache)
     _decoder_cache_patched = True
-    log.debug(f"Patched LeRobot VideoDecoderCache with LRU max_size={max_size}")
+    _decoder_cache_settings = settings
+    log.info(
+        f"Patched LeRobot VideoDecoderCache max_size={max_size} open_mode={open_mode}",
+        rank0_only=False,
+    )
 
 
 def _parallel_map(
@@ -346,11 +577,20 @@ class BaseActionLeRobotDataset(Dataset):
         enable_fast_init: bool = False,
         fast_init_max_workers: int = 64,
         min_episode_length_frames: int | None = None,
+        max_episode_length_frames: int | None = None,
         max_episode_blocks: int = -1,
+        video_backend: str | None = None,
+        video_decoder_cache_size: int = _LRU_VIDEO_CACHE_MAX_SIZE,
+        video_decoder_open_mode: str = "fsspec",
     ) -> None:
         super().__init__()
         _ensure_hf_hub_offline()
-        _patch_decoder_cache()
+        self._video_decoder_cache_size = int(video_decoder_cache_size)
+        self._video_decoder_open_mode = str(video_decoder_open_mode)
+        _patch_decoder_cache(
+            max_size=self._video_decoder_cache_size,
+            open_mode=self._video_decoder_open_mode,
+        )
         self._memprofile = _memprofile_enabled()
 
         assert sample_stride >= 1, f"sample_stride must be >= 1, got {sample_stride}"
@@ -420,6 +660,19 @@ class BaseActionLeRobotDataset(Dataset):
             # Subclasses that override ``_append_index_records`` are expected
             # to honor this attribute themselves.
             self._min_episode_length_frames: int | None = min_episode_length_frames
+            # Optional whole-episode drop: if the 4N+1-padded fetch length
+            # (keep_ranges concat after FPS stride) exceeds this, the episode
+            # is omitted from ``_episode_records`` so workers never decode it.
+            # Distinct from ``max_episode_blocks``, which truncates.
+            if max_episode_length_frames is not None and max_episode_length_frames < 2:
+                raise ValueError(
+                    f"max_episode_length_frames must be >= 2 or None, got {max_episode_length_frames}"
+                )
+            self._max_episode_length_frames: int | None = max_episode_length_frames
+            # None → LeRobot default (torchcodec if installed, else pyav).
+            self._video_backend: str | None = video_backend
+            # 0 = decode then drop (no 64-slot concatenated-mp4 LRU).
+            # open_mode "path" uses VideoDecoder(path) instead of fsspec AVIO.
             self._delta_timestamps: dict[str, list[float]] = {}
             self._to_opencv: np.ndarray | dict[str, np.ndarray] = np.eye(3, dtype=np.float32)
 
@@ -606,6 +859,24 @@ class BaseActionLeRobotDataset(Dataset):
                     f"dropped {dropped} / {before} chunk-eligible spans"
                 )
 
+        if self._whole_episode and self._max_episode_length_frames is not None:
+            length_lookup = list(meta.episodes["length"])
+            native_fps = float(meta.fps)
+            before = len(episode_spans)
+            episode_spans = [
+                (eid, ss, vl)
+                for (eid, ss, vl) in episode_spans
+                if self._padded_whole_episode_frames(int(length_lookup[eid]), native_fps)
+                <= self._max_episode_length_frames
+            ]
+            dropped = before - len(episode_spans)
+            if dropped > 0:
+                log.info(
+                    f"{self.__class__.__name__}: "
+                    f"max_episode_length_frames={self._max_episode_length_frames} "
+                    f"dropped {dropped} / {before} whole-episode samples (too long to decode)"
+                )
+
         class_name = self.__class__.__name__
         label = f" [{dataset_label}]" if dataset_label else ""
         log.info(f"{class_name}{label}: split={self._split}, num episodes={len(episode_ids)}")
@@ -670,6 +941,7 @@ class BaseActionLeRobotDataset(Dataset):
                 root=root,
                 delta_timestamps=self._delta_timestamps,
                 tolerance_s=self._tolerance_s,
+                video_backend=self._video_backend,
                 dataset_label=label,
                 prefetched_meta=meta,
             )
@@ -689,6 +961,10 @@ class BaseActionLeRobotDataset(Dataset):
             return ds
 
         _ensure_hf_hub_offline()
+        _patch_decoder_cache(
+            max_size=self._video_decoder_cache_size,
+            open_mode=self._video_decoder_open_mode,
+        )
 
         build_args = self._dataset_build_args[ds_idx]
         if build_args is None:
@@ -710,7 +986,10 @@ class BaseActionLeRobotDataset(Dataset):
                 # v3 (``observation.image.<name>``) video-column conventions.
                 delta_ts = {k: v for k, v in delta_ts.items() if not k.startswith("observation.image")}
 
-            log.info(f"Loading shard root={build_args['root']}")
+            log.info(
+                f"Loading shard root={build_args['root']} "
+                f"video_backend={build_args['video_backend'] or 'default'}"
+            )
             ds = LeRobotDataset(
                 repo_id=build_args["repo_id"],
                 root=build_args["root"],
@@ -856,6 +1135,18 @@ class BaseActionLeRobotDataset(Dataset):
         )
         return stride
 
+    def _padded_whole_episode_frames(self, n_native: int, native_fps: float) -> int:
+        """``4N+1`` padded frame count that whole-episode fetch would produce.
+
+        ``n_native`` is the raw (or keep_ranges-concat) frame count at ``native_fps``,
+        before target-FPS stride. Used at index build to drop over-long episodes
+        without opening any video files.
+        """
+        stride_f = float(native_fps) / self._fps
+        stride = max(1, int(round(stride_f)))
+        n_real = (int(n_native) + stride - 1) // stride
+        return round_up_4n1(n_real)
+
     @staticmethod
     def _split_contiguous_row_runs(rows: list[int], stride: int) -> list[list[int]]:
         """Split absolute row indices into contiguous runs of ``stride``.
@@ -934,16 +1225,115 @@ class BaseActionLeRobotDataset(Dataset):
         timestamps = ds.hf_dataset[rel]["timestamp"]
         return torch.stack(list(timestamps)).tolist()
 
+    @staticmethod
+    def _episode_mp4_slice(ep: Any, vid_key: str, native_fps: float) -> tuple[int, int]:
+        """``[file_start, file_stop)`` frame indices of this episode inside its packed mp4.
+
+        Packed LeRobot files concatenate many episodes. ``from_timestamp`` /
+        ``to_timestamp`` bound *this* episode; decoding outside that slice
+        would materialize the rest of the file.
+        """
+        from_ts = float(ep[f"videos/{vid_key}/from_timestamp"])
+        to_key = f"videos/{vid_key}/to_timestamp"
+        if to_key in ep and ep[to_key] is not None:
+            to_ts = float(ep[to_key])
+        else:
+            length = int(ep["length"]) if "length" in ep else int(ep["dataset_to_index"]) - int(ep["dataset_from_index"])
+            to_ts = from_ts + length / float(native_fps)
+        file_start = int(round(from_ts * float(native_fps)))
+        file_stop = int(round(to_ts * float(native_fps)))
+        if file_stop <= file_start:
+            raise ValueError(
+                f"invalid mp4 slice for {vid_key}: from_timestamp={from_ts} to_timestamp={to_ts} "
+                f"-> [{file_start}, {file_stop})"
+            )
+        return file_start, file_stop
+
+    @staticmethod
+    def _episode_file_frame_indices(
+        ep: Any,
+        vid_key: str,
+        rows: list[int],
+        native_fps: float,
+    ) -> list[int]:
+        """Map absolute hf rows to packed-mp4 frame indices for one camera.
+
+        Index is ``round(from_timestamp * fps) + (row - dataset_from_index)``.
+        Any index outside the episode's ``[from_timestamp, to_timestamp)``
+        slice is rejected so ``get_frames_at`` cannot expand to the packed file.
+        """
+        if not rows:
+            return []
+        ep_from = int(ep["dataset_from_index"])
+        file_start, file_stop = BaseActionLeRobotDataset._episode_mp4_slice(ep, vid_key, native_fps)
+        indices = [file_start + (int(row) - ep_from) for row in rows]
+        lo, hi = min(indices), max(indices)
+        if lo < file_start or hi >= file_stop:
+            raise ValueError(
+                f"video frame indices [{lo}, {hi}] fall outside episode mp4 slice "
+                f"[{file_start}, {file_stop}) for {vid_key}; refusing packed-file decode"
+            )
+        return indices
+
+    def _open_episode_video_decoder(self, video_path: str) -> tuple[Any, Any, bool]:
+        """Return ``(decoder, file_handle, must_release)`` for one packed mp4."""
+        backend = (self._video_backend or "torchcodec").lower()
+        if backend == "pyav":
+            return _PyAVIndexDecoder(str(video_path)), None, True
+        if backend != "torchcodec":
+            raise ValueError(
+                f"whole-episode video_backend must be 'torchcodec' or 'pyav', got {self._video_backend!r}"
+            )
+        import lerobot.datasets.video_utils as _vu
+
+        cache = _vu._default_decoder_cache
+        if getattr(cache, "max_size", 1) == 0 and hasattr(cache, "open_fresh"):
+            decoder, file_handle = cache.open_fresh(str(video_path))
+            return decoder, file_handle, True
+        return cache.get_decoder(str(video_path)), None, False
+
+    def _decode_camera_indices(self, decoder: Any, indices: list[int], *, video_path: str) -> torch.Tensor:
+        """Decode exactly ``len(indices)`` frames as uint8 ``[T,C,H,W]`` in ``[0, 255]``.
+
+        Uses ``get_frames_at`` (output rows == ``len(indices)``), not
+        ``get_frames_in_range``, which can expand ``stop`` to the full packed
+        file via ``slice(...).indices(num_frames)``. Torchcodec already returns
+        uint8; do not promote to float32 here (that 4x's host RSS before concat).
+        """
+        cap = self._max_episode_length_frames
+        if cap is not None and len(indices) > cap:
+            raise ValueError(
+                f"refusing to decode {len(indices)} frames from {video_path}; "
+                f"max_episode_length_frames={cap}"
+            )
+        data = decoder.get_frames_at(indices).data
+        if data.ndim == 3:
+            data = data.unsqueeze(0)
+        if int(data.shape[0]) != len(indices):
+            raise RuntimeError(
+                f"video decoder returned {int(data.shape[0])} frames from {video_path}, "
+                f"expected {len(indices)}"
+            )
+        if data.dtype != torch.uint8:
+            if torch.is_floating_point(data):
+                data = data.mul(255.0).round_().clamp_(0, 255).to(torch.uint8)
+            else:
+                data = data.to(torch.uint8)
+        return data
+
     def _fetch_whole_episode(self, ds: LeRobotDataset, episode_id: int) -> dict[str, Any]:
         """Fetch one whole episode at its exact length (whole-episode mode).
 
         Bypasses ``LeRobotDataset.__getitem__`` (fixed ``delta_timestamps``)
         and issues per-episode queries: tabular features via
-        ``_query_hf_dataset`` and camera frames via ``_query_videos``.
+        ``_query_hf_dataset``. Camera frames are decoded with integer mp4
+        indices clipped to this episode's ``from_timestamp``/``to_timestamp``
+        slice — not LeRobot's timestamp→``get_frames_at`` path, which can
+        seek across the rest of a packed file.
 
         Tabular ``4N+1`` pad is the repeated last row in ``obs_rows``. Video is
-        decoded **per contiguous run** of the unpadded rows (so pyav does not
-        scan idle gaps between keep_ranges), then the last frame is repeated
+        decoded **per contiguous run** of the unpadded rows (so idle gaps
+        between keep_ranges are not decoded), then the last frame is repeated
         in tensor space to ``target_t``.
         """
         ds._ensure_hf_dataset_loaded()
@@ -964,21 +1354,39 @@ class BaseActionLeRobotDataset(Dataset):
             camera_keys = self._whole_episode_camera_features()
             if camera_keys:
                 stride = self._whole_episode_stride(ds)
+                native_fps = float(ds.meta.fps)
+                ep = ds.meta.episodes[episode_id]
                 runs = self._split_contiguous_row_runs(obs_rows[:n_real], stride)
                 per_cam: dict[str, list[torch.Tensor]] = {key: [] for key in camera_keys}
-                for run in runs:
-                    query_ts = self._rows_to_timestamps(ds, run)
-                    chunk = ds._query_videos({key: query_ts for key in camera_keys}, episode_id)
+                opened: dict[str, tuple[Any, Any, bool]] = {}
+                try:
                     for key in camera_keys:
-                        frames = chunk[key]
-                        # lerobot squeeze(0) drops T when a run is a single frame
-                        if frames.ndim == 3:
-                            frames = frames.unsqueeze(0)
-                        per_cam[key].append(frames)
-                extra = target_t - n_real
-                for key in camera_keys:
-                    video = torch.cat(per_cam[key], dim=0) if len(per_cam[key]) > 1 else per_cam[key][0]
-                    sample[key] = self._repeat_last_time(video, extra)
+                        video_path = str(ds.root / ds.meta.get_video_file_path(episode_id, key))
+                        for run in runs:
+                            indices = self._episode_file_frame_indices(ep, key, run, native_fps)
+                            if video_path not in opened:
+                                opened[video_path] = self._open_episode_video_decoder(video_path)
+                            decoder = opened[video_path][0]
+                            frames = self._decode_camera_indices(
+                                decoder, indices, video_path=video_path
+                            )
+                            per_cam[key].append(frames)
+                    extra = target_t - n_real
+                    for key in camera_keys:
+                        chunks = per_cam.pop(key)
+                        video = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+                        del chunks
+                        sample[key] = self._repeat_last_time(video, extra)
+                        del video
+                finally:
+                    # Pop each decoder so no dict/tuple still pins AV1 state
+                    # while _release_decoder runs gc.collect().
+                    while opened:
+                        _path, (decoder, file_handle, must_release) = opened.popitem()
+                        if must_release:
+                            _release_decoder(decoder, file_handle)
+                        del decoder, file_handle
+                    gc.collect()
 
         return sample
 
@@ -1035,11 +1443,13 @@ class BaseActionLeRobotDataset(Dataset):
     # -- video formatting ----------------------------------------------------
 
     def _convert_video(self, video_tchw: torch.Tensor | None) -> torch.Tensor | None:
-        """Convert LeRobot ``(T,C,H,W)`` float video to Action ``(C,T,H,W)`` uint8.
+        """Permute LeRobot ``(T,C,H,W)`` to Action ``(C,T,H,W)`` uint8.
+
+        Whole-episode decode stays uint8, so this is only a layout permute.
+        Windowed LeRobot still yields float32 in ``[0, 1]``; convert that once.
 
         Args:
-            video_tchw: Raw floating-point video tensor in ``[0, 1]`` with
-                LeRobot layout, or ``None``.  # [T,C,H,W] | None
+            video_tchw: Raw video in LeRobot layout, or ``None``.  # [T,C,H,W] | None
 
         Returns:
             Action-formatted video tensor, or ``None``.  # [C,T,H,W] | None
@@ -1051,9 +1461,11 @@ class BaseActionLeRobotDataset(Dataset):
                 f"{self.__class__.__name__}._convert_video expected video with shape [T,C,H,W], "
                 f"got ndim={video_tchw.ndim}"
             )
+        if video_tchw.dtype == torch.uint8:
+            return video_tchw.permute(1, 0, 2, 3)  # [C,T,H,W]
         if not torch.is_floating_point(video_tchw):
             raise TypeError(
-                f"{self.__class__.__name__}._convert_video expected floating-point video in [0, 1], "
+                f"{self.__class__.__name__}._convert_video expected uint8 or floating-point video, "
                 f"got dtype={video_tchw.dtype}"
             )
         video_min = video_tchw.amin()  # []
@@ -1063,8 +1475,7 @@ class BaseActionLeRobotDataset(Dataset):
                 f"{self.__class__.__name__}._convert_video expected floating-point video in [0, 1], "
                 f"got range=[{video_min.item():.6f}, {video_max.item():.6f}]"
             )
-        formatted_video = (video_tchw * 255.0).clamp(0.0, 255.0).to(torch.uint8).permute(1, 0, 2, 3)  # [C,T,H,W]
-        return formatted_video
+        return (video_tchw * 255.0).clamp(0.0, 255.0).to(torch.uint8).permute(1, 0, 2, 3)  # [C,T,H,W]
 
     # -- result building -----------------------------------------------------
 

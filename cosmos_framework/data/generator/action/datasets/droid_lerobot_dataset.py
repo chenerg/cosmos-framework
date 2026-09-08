@@ -47,6 +47,10 @@ from cosmos_framework.utils import log
 
 _FILTER_DICT_PATH = "/scratch/fsw/portfolios/cosmos/projects/cosmos_base_training/users/haolia/workspace/droid_oss_inputs/keep_ranges_1_0_1.json"
 _DROID_GCS_PREFIX = "gs://xembodiment_data/r2d2/r2d2-data-full/"
+# Wan VAE needs 4N+1 frames; DROID windowed recipes use chunk_length=32 → 33
+# observation frames. Drop shorter episodes at index build, with or without
+# keep_ranges. With a filter, the concatenated keep_ranges length is used.
+_DROID_MIN_EPISODE_FRAMES = 33
 
 
 def droid_keep_ranges_gcs_key(ep_id: str) -> str:
@@ -115,6 +119,10 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         max_num_history_actions: int = 0,
         use_image_augmentation: bool = False,
         max_episode_blocks: int = -1,
+        max_episode_length_frames: int | None = None,
+        video_backend: str | None = None,
+        video_decoder_cache_size: int = 64,
+        video_decoder_open_mode: str = "fsspec",
     ) -> None:
         """ """
         if chunk_length == -1:
@@ -148,6 +156,11 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             tolerance_s=tolerance_s,
             enable_fast_init=enable_fast_init,
             max_episode_blocks=max_episode_blocks,
+            min_episode_length_frames=_DROID_MIN_EPISODE_FRAMES,
+            max_episode_length_frames=max_episode_length_frames,
+            video_backend=video_backend,
+            video_decoder_cache_size=video_decoder_cache_size,
+            video_decoder_open_mode=video_decoder_open_mode,
         )
         self._use_success_only = use_success_only
         self._video_mode = video_mode
@@ -238,6 +251,9 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
             ranges = self._filter_dict.get(droid_keep_ranges_gcs_key(ep_id_str))
         return ranges
 
+    def _min_keep_frames(self) -> int:
+        return self._min_episode_length_frames or _DROID_MIN_EPISODE_FRAMES
+
     def _append_index_records(self, *, meta, ds_idx: int, dataset_label: str | None = None) -> None:
         """ """
         if not self._use_filter_dict:
@@ -263,9 +279,13 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
 
         log.info(f"{class_name}{label}: split={self._split}, num episodes={len(episode_ids)}")
 
+        min_len = self._min_keep_frames()
         if self._whole_episode:
             kept_eps = 0
             kept_frames = 0
+            dropped_short = 0
+            dropped_long = 0
+            native_fps = float(meta.fps)
             for episode_id, sample_start, _valid_len in episode_spans:
                 ep = meta.episodes[episode_id]
                 ep_id_str = ep["episode_id"]
@@ -275,25 +295,44 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                     continue
                 clipped = clip_droid_keep_ranges(ranges, length)
                 concat_len = sum(end - start for start, end in clipped)
-                if concat_len < 2:
+                if concat_len < min_len:
+                    dropped_short += 1
                     continue
+                if self._max_episode_length_frames is not None:
+                    padded = self._padded_whole_episode_frames(concat_len, native_fps)
+                    if padded > self._max_episode_length_frames:
+                        dropped_long += 1
+                        continue
                 self._keep_ranges_by_episode[ep_id_str] = clipped
                 self._episode_records.append((ds_idx, sample_start, 1, episode_id))
                 self._num_valid_indices += 1
                 self._episode_cum_ends.append(self._num_valid_indices)
                 kept_eps += 1
                 kept_frames += concat_len
+            extra = []
+            if dropped_short:
+                extra.append(f"{dropped_short} empty or <{min_len}-frame after clip")
+            if dropped_long:
+                extra.append(
+                    f"{dropped_long} over max_episode_length_frames={self._max_episode_length_frames}"
+                )
             log.info(
                 f"{class_name}{label}: keep_ranges concat kept {kept_eps} episodes / "
-                f"{kept_frames} frames (dropped empty or <2-frame after clip)"
+                f"{kept_frames} frames"
+                + (f" (dropped {', '.join(extra)})" if extra else "")
             )
             return
 
         filtered_count = 0
         for episode_id, sample_start, valid_len in episode_spans:
-            ep_id_str = meta.episodes[episode_id]["episode_id"]
+            ep = meta.episodes[episode_id]
+            ep_id_str = ep["episode_id"]
             ranges = self._lookup_filter_ranges(ep_id_str)
             if ranges is None:
+                continue
+            clipped = clip_droid_keep_ranges(ranges, int(ep["length"]))
+            concat_len = sum(end - start for start, end in clipped)
+            if concat_len < min_len:
                 continue
             for s, e in ranges:
                 sub_start = max(s, 0)
@@ -385,13 +424,19 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
 
         Left and right exterior cameras are downscaled by 2x so that they
         tile to the same width as the wrist view. The output height is 3H/2.
+        Bilinear interpolate runs on the decoded dtype (uint8 stays uint8).
+        Full-res shoulder clips are dropped after downsample; the three camera
+        keys are popped after concat so ``sample`` does not keep extra refs.
 
         Returns:
-            Composited raw video tensor in ``(T,C,H_out,W)`` float format.
+            Composited raw video tensor in ``(T,C,3H/2,W)``.
         """
-        wrist = sample[self._image_features["wrist"]]  # [T,C,H,W]
-        left = sample[self._image_features["left"]]  # [T,C,H_l,W_l]
-        right = sample[self._image_features["right"]]  # [T,C,H_r,W_r]
+        wrist_key = self._image_features["wrist"]
+        left_key = self._image_features["left"]
+        right_key = self._image_features["right"]
+        wrist = sample[wrist_key]  # [T,C,H,W]
+        left = sample[left_key]  # [T,C,H_l,W_l]
+        right = sample[right_key]  # [T,C,H_r,W_r]
 
         if self._use_image_augmentation:
             if self._image_augmentor is None:
@@ -405,16 +450,25 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                 )
             n, m = wrist.shape[0], wrist.shape[0] + left.shape[0]
             combined = self._image_augmentor(torch.cat([wrist, left, right], dim=0))
+            del wrist, left, right
             wrist, left, right = combined[:n], combined[n:m], combined[m:]
+            del combined
 
         _, _, h_w, w_w = wrist.shape
         half_h, half_w = h_w // 2, w_w // 2
 
-        left = F.interpolate(left, size=(half_h, half_w), mode="bilinear", align_corners=False)  # [T,C,H/2,W/2]
-        right = F.interpolate(right, size=(half_h, half_w), mode="bilinear", align_corners=False)  # [T,C,H/2,W/2]
-        bottom = torch.cat([left, right], dim=-1)  # [T,C,H/2,W]
+        left_ds = F.interpolate(left, size=(half_h, half_w), mode="bilinear", align_corners=False)  # [T,C,H/2,W/2]
+        del left
+        right_ds = F.interpolate(right, size=(half_h, half_w), mode="bilinear", align_corners=False)  # [T,C,H/2,W/2]
+        del right
+        bottom = torch.cat([left_ds, right_ds], dim=-1)  # [T,C,H/2,W]
+        del left_ds, right_ds
 
         composite = torch.cat([wrist, bottom], dim=-2)  # [T,C,3H/2,W]
+        del wrist, bottom
+        sample.pop(wrist_key, None)
+        sample.pop(left_key, None)
+        sample.pop(right_key, None)
         return composite  # [T,C,3H/2,W]
 
     def _build_action_spec(self) -> ActionSpec:

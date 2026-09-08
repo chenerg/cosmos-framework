@@ -15,15 +15,54 @@ to ``RankPartitionedDataLoader`` (mirroring how the vision recipe uses
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
+from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot import (
+    max_frames_for_pre_tf_sequence_length,
+)
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.robotwin_lerobot_dataset import RoboTwinLeRobotDataset
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
+from cosmos_framework.utils import log
+
+# DROID concat_view after ActionTransformPipeline resize/pad, then Wan VAE÷16
+# and patch_spatial=2. Used to turn a pre-TF token budget into a frame cap.
+_DROID_CONCAT_SPATIAL_TOKENS: dict[str, int] = {
+    "256": 80,  # 320×256
+    "480": 391,  # 736×544
+}
+
+
+def _resolve_max_episode_length_frames(
+    max_episode_length_frames: int | None,
+    max_pre_tf_tokens: int | None,
+    resolution: str | int | None,
+) -> int | None:
+    """Prefer an explicit frame cap; otherwise derive one from the token budget."""
+    if max_episode_length_frames is not None:
+        return max_episode_length_frames
+    if max_pre_tf_tokens is None:
+        return None
+    res_key = str(resolution) if resolution is not None else ""
+    spatial = _DROID_CONCAT_SPATIAL_TOKENS.get(res_key)
+    if spatial is None:
+        raise ValueError(
+            f"max_pre_tf_tokens={max_pre_tf_tokens} needs a known DROID concat_view "
+            f"resolution to convert to frames; got {resolution!r}. Pass "
+            f"max_episode_length_frames explicitly, or use resolution in "
+            f"{sorted(_DROID_CONCAT_SPATIAL_TOKENS)}."
+        )
+    cap = max_frames_for_pre_tf_sequence_length(max_pre_tf_tokens, spatial_tokens_per_latent=spatial)
+    log.info(
+        f"max_pre_tf_tokens={max_pre_tf_tokens} resolution={res_key} "
+        f"(K={spatial}) -> max_episode_length_frames={cap}"
+    )
+    return cap
 
 
 class ActionSFTDataset(Dataset):
@@ -49,22 +88,34 @@ class ActionSFTDataset(Dataset):
 class ActionIterableShuffleDataset(IterableDataset):
     """Streaming view of a map-style ``ActionSFTDataset``.
 
-    Each ``(rank, worker)`` is assigned a DISJOINT subset of episodes (sharded over
+    Each ``(rank, worker)`` is assigned a subset of episodes (sharded over
     ``shard_world_size * num_workers``), shuffles its episode ORDER, and streams the
     windows WITHIN each episode sequentially -> within-rank batch diversity (the N
     workers of a rank stream N different episodes) AND cross-rank diversity, while
     keeping reads sequential (I/O locality + COW; no RandomSampler random-access OOM).
+    When there are more ``(rank, worker)`` shards than episodes, extra shards wrap
+    with ``global_shard % n_blocks`` so every stream still yields. Otherwise a
+    DataLoader worker whose slice is empty would spin in ``while True`` without
+    ``yield``, and that rank's pre-warm ``next(dl_iter)`` would hang forever.
     Re-shuffles each epoch and streams indefinitely (the trainer stops at ``max_iter``).
 
     ``shard_world_size`` / ``shard_rank`` are set by ``RankPartitionedDataLoader``.
     """
 
-    def __init__(self, dataset: "ActionSFTDataset", seed: int = 42):
+    def __init__(
+        self,
+        dataset: "ActionSFTDataset",
+        seed: int = 42,
+        worker_restart_every_n: int | None = None,
+    ):
         super().__init__()
         self._dataset = dataset
         self._seed = int(seed)
         self.shard_world_size = 1
         self.shard_rank = 0
+        if worker_restart_every_n is not None and worker_restart_every_n < 1:
+            raise ValueError(f"worker_restart_every_n must be >= 1 or None, got {worker_restart_every_n}")
+        self._worker_restart_every_n = worker_restart_every_n
 
     def __len__(self) -> int:  # informational only; iteration is infinite
         return len(self._dataset)
@@ -73,20 +124,55 @@ class ActionIterableShuffleDataset(IterableDataset):
         import torch
 
         blocks = self._dataset.get_shuffle_blocks()
+        n_blocks = len(blocks)
+        if n_blocks == 0:
+            raise RuntimeError("ActionIterableShuffleDataset: get_shuffle_blocks() is empty")
         wi = get_worker_info()
         wid = wi.id if wi is not None else 0
         nw = wi.num_workers if wi is not None else 1
         global_shard = int(self.shard_rank) * nw + wid
         total_shards = max(1, int(self.shard_world_size) * nw)
+        # More shards than episodes (e.g. 8 ranks × 4 workers on a 25-episode
+        # subset) would otherwise give some workers an empty slice. An empty
+        # `for b in order[shard::total]:` body never yields, so the worker
+        # busy-loops epochs and that rank hangs in DataLoader pre-warm.
+        stride = min(total_shards, n_blocks)
+        my_shard = global_shard % stride
+        if global_shard >= n_blocks:
+            log.warning(
+                "ActionIterableShuffleDataset: "
+                f"{total_shards} (rank,worker) shards > {n_blocks} episodes; "
+                f"wrapping shard {global_shard} -> {my_shard} so this stream "
+                f"is not empty (duplicating episodes). "
+                f"rank={self.shard_rank} worker={wid}/{nw}.",
+                rank0_only=False,
+            )
         epoch = 0
+        yielded = 0
         while True:
             g = torch.Generator()
             g.manual_seed(self._seed + epoch)  # same permutation across all (rank,worker) -> disjoint shard
-            order = torch.randperm(len(blocks), generator=g).tolist()
-            for b in order[global_shard::total_shards]:
+            order = torch.randperm(n_blocks, generator=g).tolist()
+            assigned = order[my_shard::stride]
+            if not assigned:
+                # Unreachable when n_blocks > 0; keep a blocking wait instead of
+                # a 100% CPU empty-epoch spin if the slice is ever empty.
+                time.sleep(0.05)
+                epoch += 1
+                continue
+            for b in assigned:
                 start, length = blocks[b]
                 for idx in range(start, start + length):
                     yield self._dataset[idx]
+                    yielded += 1
+                    if (
+                        self._worker_restart_every_n is not None
+                        and yielded >= self._worker_restart_every_n
+                    ):
+                        # End this iterator so DataLoader can respawn workers
+                        # (persistent_workers=False) and FFmpeg native state dies
+                        # with the process.
+                        return
             epoch += 1
 
 
@@ -116,6 +202,12 @@ def get_action_droid_sft_dataset(
     episode_shuffle_seed: int = 42,
     use_success_only: bool = True,
     max_episode_blocks: int = -1,
+    max_episode_length_frames: int | None = None,
+    max_pre_tf_tokens: int | None = None,
+    video_backend: str | None = None,
+    video_decoder_cache_size: int = 64,
+    video_decoder_open_mode: str = "fsspec",
+    worker_restart_every_n: int | None = None,
 ) -> Dataset:
     """Build the DROID action SFT dataset: ``action_space='joint_pos'`` (8D) +
     ``use_state`` (raw/un-normalized), concat_view, chunk_length 32.
@@ -124,10 +216,15 @@ def get_action_droid_sft_dataset(
     fetched at the episode's exact length, rounded UP to ``4N + 1`` frames
     with tail-frame / last-action padding.  ``max_episode_blocks`` caps the
     length at ``1 + max_episode_blocks * 4`` observation frames (``-1`` =
-    unlimited); it only applies in whole-episode mode.  With
+    unlimited); it only applies in whole-episode mode.  ``max_episode_length_frames``
+    drops (does not truncate) whole-episode samples whose 4N+1 padded length
+    exceeds the cap, at index build, so workers never decode those videos.
+    ``max_pre_tf_tokens`` converts a PackingDataLoader token budget into that
+    frame cap using ``resolution``.  With
     ``use_filter_dict=True``, each episode's keep_ranges segments are
-    concatenated into that one sample (empty / missing / ``<2``-frame
-    episodes are dropped when the index is built).
+    concatenated into that one sample (empty / missing / ``<33``-frame
+    episodes are dropped when the index is built, with or without the
+    filter).
 
     Reads ``root`` (a merged/versioned DROID LeRobot root) as a single flat
     dataset; ``use_success_only=True`` filters to the ``success/`` split."""
@@ -144,6 +241,12 @@ def get_action_droid_sft_dataset(
         filter_dict_path=filter_dict_path,
         use_success_only=use_success_only,
         max_episode_blocks=max_episode_blocks,
+        max_episode_length_frames=_resolve_max_episode_length_frames(
+            max_episode_length_frames, max_pre_tf_tokens, resolution
+        ),
+        video_backend=video_backend,
+        video_decoder_cache_size=video_decoder_cache_size,
+        video_decoder_open_mode=video_decoder_open_mode,
     )
     dataset: Dataset = DROIDLeRobotDataset(root=root, **shard_kwargs)
     transform = ActionTransformPipeline(
@@ -158,7 +261,9 @@ def get_action_droid_sft_dataset(
     )
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:
-        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+        return ActionIterableShuffleDataset(
+            sft, seed=episode_shuffle_seed, worker_restart_every_n=worker_restart_every_n
+        )
     return sft
 
 

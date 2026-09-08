@@ -22,6 +22,14 @@ if TYPE_CHECKING:
 JOB_INFO = {}
 
 
+def _generate_wandb_id() -> str:
+    """WandB 0.19+ moved generate_id off wandb.util onto wandb.sdk.lib.runid."""
+    generate_id = getattr(wandb.util, "generate_id", None)
+    if generate_id is None:
+        from wandb.sdk.lib.runid import generate_id
+    return generate_id()
+
+
 def set_wandb_job_info(job_info: dict) -> None:
     """Set the job info for the W&B logger.
 
@@ -50,7 +58,7 @@ def init_wandb(config: Config, model: ImaginaireModel) -> None:
     wandb_id = _read_wandb_id(config_job, config_checkpoint)
     if wandb_id is None:
         # Generate a new W&B job ID.
-        wandb_id = wandb.util.generate_id()
+        wandb_id = _generate_wandb_id()
         _write_wandb_id(config_job, config_checkpoint, wandb_id=wandb_id)
         log.info(f"Generating new wandb ID: {wandb_id}")
     else:
@@ -87,7 +95,7 @@ def init_wandb(config: Config, model: ImaginaireModel) -> None:
         ):
             log.warning("W&B run exists but current user lacks update permission; starting a new run instead.")
             # Generate and persist a new wandb id, then create a fresh run.
-            wandb_id = wandb.util.generate_id()
+            wandb_id = _generate_wandb_id()
             _write_wandb_id(config_job, config_checkpoint, wandb_id=wandb_id)
             wandb.init(
                 force=True,

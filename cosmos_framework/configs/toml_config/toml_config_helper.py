@@ -69,14 +69,12 @@ PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
         # not config.job.* — hoist it out of the job section.
         ("job", "upload_reproducible_setup"): ("upload_reproducible_setup",),
         # No VLM analog — skip these leaves
-        ("model", "max_num_tokens_after_packing"): None,
         ("model", "joint_attn_implementation"): None,
         ("model", "causal_training_strategy"): None,
         ("model", "teacher_forcing_block_size_min"): None,
         ("model", "teacher_forcing_block_size_max"): None,
         ("model", "teacher_forcing_history_blocks_min"): None,
         ("model", "teacher_forcing_history_blocks_max"): None,
-        ("model", "teacher_forcing_max_sequence_length"): None,
         ("model", "teacher_forcing_dense_mode"): None,
         ("model", "teacher_forcing_visualize_sdpa_mask"): None,
         ("model", "lora_enabled"): None,

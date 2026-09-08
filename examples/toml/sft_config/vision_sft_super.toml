@@ -14,7 +14,6 @@ name         = "vision_sft_super"
 wandb_mode   = "disabled"
 
 [model]
-max_num_tokens_after_packing = 45056
 joint_attn_implementation    = "two_way"
 lora_enabled                 = true
 lora_rank                    = 16

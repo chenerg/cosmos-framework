@@ -25,7 +25,7 @@
 #   model.attn_implementation      -> model.config.policy.attn_implementation
 #   model.backbone.*               -> model.config.policy.backbone.*
 #   model.ema.*                    -> model.config.ema.*
-#   model.{max_num_tokens_after_packing, joint_attn_implementation, lora_*,
+#   model.{joint_attn_implementation, lora_*,
 #          tokenizer.*} and dataloader_train.{max_sequence_length, seed} -> SKIPPED
 
 [job]

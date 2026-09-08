@@ -47,7 +47,6 @@ SUPER_MODEL_CONFIG = dict(
     lora_rank=16,
     lora_target_modules="q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen",
     max_action_dim=32,
-    max_num_tokens_after_packing=45056,
     num_embodiment_domains=32,
     resolution="720",
     sound_gen=False,

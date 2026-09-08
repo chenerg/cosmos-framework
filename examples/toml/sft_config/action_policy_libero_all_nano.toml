@@ -19,7 +19,6 @@ wandb_mode   = "online"
 
 [model]
 precision = "bfloat16"
-max_num_tokens_after_packing = 74000
 
 [model.parallelism]
 data_parallel_shard_degree     = 8

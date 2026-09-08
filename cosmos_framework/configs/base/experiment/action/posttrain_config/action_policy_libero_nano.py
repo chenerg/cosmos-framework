@@ -26,13 +26,10 @@ cs = ConfigStore.instance()
 
 
 def _action_policy_libero_nano_model_config() -> dict:
-    """LIBERO model config: capped packed tokens, selective activation
-    checkpointing, fresh diffusion-expert init, 10x vision flow-matching loss.
+    """LIBERO model config: selective activation checkpointing, fresh
+    diffusion-expert init, 10x vision flow-matching loss.
     Keep ``encode_exact_durations=[17, 61, 73]`` to match the Cosmos3-Nano base."""
     cfg = copy.deepcopy(NANO_MODEL_CONFIG)  # action_gen=True, max_action_dim=64
-    # Cap the packed sequence. Uncapped (-1) + a large max_samples_per_batch packs
-    # one very long sequence and OOMs even on H200; 74000 keeps the GA-validated bound.
-    cfg["max_num_tokens_after_packing"] = 74000
     cfg["activation_checkpointing"]["mode"] = "selective"
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     cfg["rectified_flow_training_config"]["loss_scale"] = 10.0

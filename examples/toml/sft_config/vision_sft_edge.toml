@@ -14,7 +14,6 @@ name         = "vision_sft_edge"
 wandb_mode   = "disabled"
 
 [model]
-max_num_tokens_after_packing = 45056
 joint_attn_implementation    = "two_way"
 precision                    = "bfloat16"                # was [model.parallelism].precision
 

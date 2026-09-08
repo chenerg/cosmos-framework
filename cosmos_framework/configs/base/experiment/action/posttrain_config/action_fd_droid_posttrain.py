@@ -23,7 +23,6 @@ def _make_model_config() -> dict:
     cfg["sound_gen"] = False
     cfg["sound_dim"] = 64
     cfg["sound_latent_fps"] = 25
-    cfg["max_num_tokens_after_packing"] = 74000
     cfg["resolution"] = "720"
     cfg["activation_checkpointing"]["mode"] = "selective"
 
@@ -161,7 +160,7 @@ action_fd_droid_posttrain = LazyDict(
             audio_sample_rate=48000,
             dataset_name="action_droid",
             max_samples_per_batch=None,
-            max_sequence_length="${model.config.max_num_tokens_after_packing}",
+            max_sequence_length=74000,
             patch_spatial="${model.config.diffusion_expert_config.patch_spatial}",
             sound_latent_fps="${model.config.sound_latent_fps}",
             tokenizer_spatial_compression_factor="${model.config.tokenizer.spatial_compression_factor}",

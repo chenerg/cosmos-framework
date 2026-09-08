@@ -31,13 +31,10 @@ cs = ConfigStore.instance()
 
 
 def _action_policy_libero_edge_model_config() -> dict:
-    """LIBERO model config on the Edge baseline: capped packed tokens, selective
-    activation checkpointing, fresh diffusion-expert init. Keep
+    """LIBERO model config on the Edge baseline: selective activation
+    checkpointing, fresh diffusion-expert init. Keep
     ``encode_exact_durations=[17, 61, 73]`` to match the Cosmos3 base."""
     cfg = copy.deepcopy(EDGE_MODEL_CONFIG)  # action_gen=True, max_action_dim=64
-    # Cap the packed sequence (same bound as the nano action recipe; uncapped
-    # packs one very long sequence and OOMs).
-    cfg["max_num_tokens_after_packing"] = 74000
     cfg["activation_checkpointing"]["mode"] = "selective"
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     # Edge baseline already sets rectified_flow loss_scale=10.0 / image_loss_scale=None.

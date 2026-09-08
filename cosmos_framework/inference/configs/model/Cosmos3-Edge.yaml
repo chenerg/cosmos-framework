@@ -61,7 +61,6 @@ model:
     lora_rank: 16
     lora_target_modules: q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen
     max_action_dim: 64
-    max_num_tokens_after_packing: 74000
     natten_parameter_list: null
     net: null
     num_embodiment_domains: 32

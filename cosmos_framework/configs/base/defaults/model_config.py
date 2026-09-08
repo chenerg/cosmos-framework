@@ -177,7 +177,6 @@ class OmniMoTModelConfig:
     state_t: int = 8  # for latent model, ref to the latent number of frames
     latent_downsample_factor: int = 8
     resolution: str = "512"
-    max_num_tokens_after_packing: int = 13312  # Final num tokens after sequence packing
 
     # Attention implementation for joint understanding + generation
     # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.
@@ -244,9 +243,6 @@ class OmniMoTModelConfig:
     teacher_forcing_block_size_max: int = 4
     teacher_forcing_history_blocks_min: int = 1
     teacher_forcing_history_blocks_max: int = 32
-    # Required by OmniMoTCausalModel. Limits the expanded [UND|clean|noisy]
-    # sequence before either Dense correctness mode allocates its mask(s).
-    teacher_forcing_max_sequence_length: int | None = None
     # "global" builds one packed Dense Mask; "per_sample" loops over packed
     # samples and builds one smaller Dense Mask for each sample.
     teacher_forcing_dense_mode: str = "global"

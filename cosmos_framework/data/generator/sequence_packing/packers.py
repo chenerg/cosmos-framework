@@ -43,7 +43,6 @@ def pack_input_sequence(
     gen_data_clean: GenerationDataClean,
     input_timesteps: torch.Tensor,
     special_tokens: dict[str, int],
-    max_num_tokens: int | None = None,
     latent_patch_size: int = 1,
     skip_text_tokens: bool = False,
     include_end_of_generation_token: bool = False,
@@ -75,7 +74,6 @@ def pack_input_sequence(
             diffusion_forcing (per-frame independent sigma). Entries are extracted per
             sample as a float (numel==1) or Tensor(T_max,) for per-frame indexing.
         special_tokens: Dictionary containing special token IDs (eos_token_id, start_of_generation, end_of_generation)
-        max_num_tokens: Maximum number of tokens in the packed sequence
         latent_patch_size: Patch size used by the network to pack latents
         skip_text_tokens: If True, skip packing text tokens
         include_end_of_generation_token: If True, append end-of-generation token
@@ -106,8 +104,6 @@ def pack_input_sequence(
     Returns:
         PackedSequence containing all packed tensors and metadata. See PackedSequence for field details.
     """
-    del max_num_tokens
-
     assert special_tokens is not None, "Special tokens must be provided"
     assert isinstance(input_timesteps, torch.Tensor), "input_timesteps must be a tensor"
     if input_timesteps.is_cuda:

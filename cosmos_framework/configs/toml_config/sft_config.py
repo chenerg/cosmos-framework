@@ -317,14 +317,6 @@ class ModelConfig(BaseModel):
             "lands at ``model.config.precision`` now."
         ),
     )
-    max_num_tokens_after_packing: int = Field(
-        default=13312,
-        description=(
-            "Token-packing target: max number of tokens after sequence "
-            "packing. -1 disables the cap. VFM-only — VLM uses "
-            "data_setting.max_tokens and policy.qwen_max_video_token_length."
-        ),
-    )
     causal_training_strategy: str = Field(
         default="none",
         description=(
@@ -352,14 +344,6 @@ class ModelConfig(BaseModel):
         default=32,
         ge=1,
         description="Inclusive maximum clean-history window measured in causal blocks.",
-    )
-    teacher_forcing_max_sequence_length: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description=(
-            "Required safety limit for the expanded one-dimensional "
-            "[UND|clean|noisy] teacher-forcing sequence."
-        ),
     )
     teacher_forcing_dense_mode: Literal["global", "per_sample"] = Field(
         default="global",

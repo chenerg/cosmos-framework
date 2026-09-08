@@ -234,13 +234,6 @@ action_policy_droid_nano = LazyDict(
 action_policy_droid_nano["model"]["config"]["tokenizer"]["encode_exact_durations"] = [33]
 
 
-# Uncap the packed-sequence length. The NANO default (45056) caps the packed sequence,
-# truncating long DROID windows to ~1/4 of their natural length; -1 (uncapped) processes
-# the full vision sequence per step. Does not change the per-token loss; widens the
-# effective vision context per step.
-action_policy_droid_nano["model"]["config"]["max_num_tokens_after_packing"] = -1
-
-
 # Weight the vision flow-matching loss 10x in the total loss (the NANO default is 1.0).
 # loss_scale multiplies only the vision term, balancing it against the action loss
 # (action_loss_weight=10) so both heads train at comparable gradient magnitude.

@@ -30,7 +30,6 @@ NANO_MODEL_CONFIG = dict(
     latent_downsample_factor=16,
     log_enc_time_every_n=100,
     max_action_dim=64,
-    max_num_tokens_after_packing=45056,
     num_embodiment_domains=32,
     resolution="720",
     sound_gen=False,

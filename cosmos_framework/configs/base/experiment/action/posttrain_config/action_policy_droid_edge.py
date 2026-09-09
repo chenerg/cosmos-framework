@@ -5,7 +5,7 @@
 
 Edge-tier sibling of ``action_policy_droid_nano``: same DROID dataflow
 (``DROIDLeRobotDataset``, ``joint_pos`` 8D + ``use_state``, raw/un-normalized,
-    concat_view 480p, whole-episode ``chunk_length=-1``, JSON action prompts), same optimizer /
+    concat_view 256p, whole-episode ``chunk_length=-1``, JSON action prompts), same optimizer /
 scheduler / trainer / checkpoint blocks, but the model baseline is
 ``EDGE_MODEL_CONFIG`` (Nemotron-2B-Dense-VL dense backbone) instead of
 ``NANO_MODEL_CONFIG``. ``EDGE_MODEL_CONFIG`` already ships ``action_gen=True``
@@ -41,6 +41,14 @@ def _action_policy_droid_edge_model_config() -> dict:
     cfg["diffusion_expert_config"]["load_weights_from_pretrained"] = False
     # Edge baseline already sets rectified_flow loss_scale=10.0 / image_loss_scale=None.
     cfg["tokenizer"]["encode_exact_durations"] = [17, 61, 73]
+    # Action SFT does not keep a second fp32 net_ema; live weights are the checkpoint.
+    cfg["ema"]["enabled"] = False
+    cfg["resolution"] = "256"
+    # Sample block size in [1, 4] and history window in [1, 32] each forward.
+    cfg["teacher_forcing_block_size_min"] = 1
+    cfg["teacher_forcing_block_size_max"] = 4
+    cfg["teacher_forcing_history_blocks_min"] = 1
+    cfg["teacher_forcing_history_blocks_max"] = 32
     return cfg
 
 
@@ -180,7 +188,7 @@ action_policy_droid_edge = LazyDict(
             dataset_name="action_droid",
             max_samples_per_batch=1,  # one whole episode per micro-batch; override via TOML
             # Pre-expansion token cap (UND+vis+action). Index drop uses
-            # max_pre_tf_tokens=48000 (~477 frames at 480p with extra=500).
+            # max_pre_tf_tokens=48000 (~2257 frames at 256p with extra=500).
             # Keep packing lookahead tiny so a near-full batch does not
             # buffer extra decoded whole-episode videos (default is 10).
             max_sequence_length=None,
@@ -195,7 +203,7 @@ action_policy_droid_edge = LazyDict(
                 num_workers=4,
                 persistent_workers=True,
                 pin_memory=True,
-                prefetch_factor=2,  # 4 held ~1 TiB of whole-episode RGB in workers
+                prefetch_factor=1,  # 1 queued decoded episode per worker; 2 held ~1 TiB host RSS
                 sampler=None,
                 # Shuffling is handled by the dataset (iterable_shuffle=True below):
                 # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-
@@ -214,8 +222,8 @@ action_policy_droid_edge = LazyDict(
                             chunk_length=-1,
                             max_episode_blocks=-1,
                             # Drop (do not truncate) episodes whose 4N+1 padded
-                            # length would exceed the 8-card 480p HBM budget
-                            # (~477 frames / 48000 pre-TF tokens, extra=500).
+                            # length would exceed the 8-card 256p HBM budget
+                            # (~2257 frames / 48000 pre-TF tokens, extra=500).
                             # Index-only; workers never decode the dropped videos.
                             max_pre_tf_tokens=48000,
                             action_space="joint_pos",
@@ -226,9 +234,9 @@ action_policy_droid_edge = LazyDict(
                             use_state=True,
                             iterable_shuffle=True,  # rank x worker episode-shuffle stream
                             episode_shuffle_seed=42,
-                            # SR boost: random crop+rescale + ColorJitter, applied CPU-side in the
-                            # DROIDLeRobotDataset image augmentor (matches i4's pipeline stage).
-                            use_image_augmentation=True,
+                            # SR boost: random crop+rescale + ColorJitter in _compose_multi_view.
+                            # Off for whole-episode: ColorJitter/interpolate copies dominate host RSS.
+                            use_image_augmentation=False,
                             # keep_ranges filter. Off by default (no JSON required). When True in
                             # whole-episode mode, each original episode's valid [start,end) segments
                             # are concatenated into one sample (empty / <2-frame dropped at index
@@ -236,8 +244,8 @@ action_policy_droid_edge = LazyDict(
                             use_filter_dict=False,
                             filter_dict_path=None,
                             action_normalization=None,
-                            viewpoint="concat_view",  # wrist 480p (top) + L/R shoulder 320x180 (bottom)
-                            resolution="480",  # 640x360 data @ 480p
+                            viewpoint="concat_view",  # wrist (top) + L/R shoulder 1/2 (bottom) → 256p 4:3
+                            resolution="256",  # 640x360 data @ 256p (320x256)
                             # Close torchcodec/FFmpeg after each episode. Packed-mp4 AV1
                             # decoder state is large; a 64-slot LRU does not help unique
                             # whole-episode streams and dominates host RSS.

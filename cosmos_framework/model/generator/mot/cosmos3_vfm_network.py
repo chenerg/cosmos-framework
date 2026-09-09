@@ -772,6 +772,7 @@ class Cosmos3VFMNetwork(PreTrainedModel):
             packed_clean_action, clean_per_token_domain_id = self.pack_action(
                 teacher_forcing.clean_action_tokens, action.token_shapes, action.domain_id
             )
+            packed_clean_action = packed_clean_action.to(target_dtype)
             packed_clean_action = self.action2llm(packed_clean_action, clean_per_token_domain_id)
             packed_clean_action = packed_clean_action + self.action_modality_embed.view(1, -1)
             clean_action_timesteps = torch.zeros(

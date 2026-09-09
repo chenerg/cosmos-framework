@@ -56,6 +56,14 @@ class TestSchemaValidation:
         assert cfg.model.parallelism.fsdp_mixed_precision_enabled is True
         assert cfg.model.parallelism.fsdp_master_dtype == "float32"
 
+    def test_vfm_fsdp_mixed_precision_defaults_to_enabled(self) -> None:
+        raw = {"job": {"task": "vfm", "experiment": "vision_sft_edge"}}
+
+        cfg = SFTExperimentConfig.model_validate(raw)
+
+        assert cfg.model.parallelism.fsdp_mixed_precision_enabled is True
+        assert cfg.model.parallelism.fsdp_master_dtype == "float32"
+
     def test_teacher_forcing_model_fields_validate(self) -> None:
         raw = {
             "job": {"task": "vfm", "experiment": "vision_sft_edge"},

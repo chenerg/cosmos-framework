@@ -16,11 +16,23 @@ from cosmos_framework.model.generator.mot.parallelize_vfm_network import (
 )
 
 
-def test_vfm_fsdp_mixed_precision_is_opt_in() -> None:
+def test_vfm_fsdp_mixed_precision_can_be_disabled() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=False, fsdp_master_dtype="float32")
 
     assert build_vfm_fsdp_mixed_precision_policy(config, "bfloat16", cast_forward_inputs=False) is None
     assert resolve_vfm_parameter_storage_dtype(torch.bfloat16, config, fsdp_enabled=True) is torch.bfloat16
+
+
+def test_vfm_fsdp_mixed_precision_defaults_to_enabled() -> None:
+    config = ParallelismConfig()
+
+    policy = build_vfm_fsdp_mixed_precision_policy(config, "bfloat16", cast_forward_inputs=False)
+
+    assert config.fsdp_mixed_precision_enabled is True
+    assert policy is not None
+    assert policy.param_dtype is torch.bfloat16
+    assert policy.reduce_dtype is torch.float32
+    assert resolve_vfm_parameter_storage_dtype(torch.bfloat16, config, fsdp_enabled=True) is torch.float32
 
 
 def test_vfm_fsdp_mixed_precision_uses_bf16_compute_and_fp32_storage() -> None:

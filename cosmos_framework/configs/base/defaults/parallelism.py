@@ -52,10 +52,12 @@ class ParallelismConfig:
     # Inference-mode mesh toggle for ParallelDims.
     enable_inference_mode: bool = False
 
-    # Opt VFM into FSDP2 mixed precision while preserving the historical
-    # pure-low-precision parameter path by default. VLM already installs an
-    # FSDP2 MixedPrecisionPolicy unconditionally and does not consume this flag.
-    fsdp_mixed_precision_enabled: bool = False
+    # VFM FSDP2 mixed precision is on by default: persistent shards and
+    # gradient reduce-scatter use ``fsdp_master_dtype``, while forward/backward
+    # stay on ``model.precision``. Set false to restore the older pure
+    # low-precision VFM parameter path. VLM already installs an FSDP2
+    # MixedPrecisionPolicy unconditionally and does not consume this flag.
+    fsdp_mixed_precision_enabled: bool = True
 
     # Dtype of the FSDP-sharded "master" parameter copy: what nn.Parameter.data
     # holds on each rank, what the optimizer reads/writes against, and what the

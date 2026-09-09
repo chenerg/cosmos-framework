@@ -20,7 +20,7 @@ def build_vfm_fsdp_mixed_precision_policy(
     *,
     cast_forward_inputs: bool,
 ) -> MixedPrecisionPolicy | None:
-    """Build an opt-in VFM FSDP2 policy without changing legacy runs."""
+    """Build the VFM FSDP2 mixed-precision policy, or None when disabled."""
 
     if not parallelism_config.fsdp_mixed_precision_enabled:
         return None
@@ -99,7 +99,7 @@ def parallelize_vfm_network(
             ``OmniMoTModelConfig.sac``. Forwarded to
             ``parallelize_unified_mot``; ``None`` falls back to the
             ``ActivationCheckpointingConfig`` defaults.
-        parallelism_config: FSDP topology, opt-in mixed-precision switch, and
+        parallelism_config: FSDP topology, mixed-precision switch, and
             persistent master-parameter dtype.
         precision: Forward/backward compute dtype name.
         attention_io_layout: Tensor layout at the attention boundary under CP.

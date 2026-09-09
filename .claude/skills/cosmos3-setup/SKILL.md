@@ -51,6 +51,7 @@ The canonical setup reference is `docs/setup.md`. The README (`README.md` § Set
 - **CUDA version alignment**: the major CUDA version from `nvidia-smi` must match `torch.version.cuda`. Mismatches cause cryptic shared-library errors.
 - **`HF_HOME`**: controls where checkpoints are cached (default: `~/.cache/huggingface`). Set this if disk space is tight or you want a shared cache.
 - **Conflicting env vars**: stale `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` env vars can silently override CLI auth. Check with `printenv | grep HF_`.
+- **This Ascend dev server — `hf download`**: use `HF_ENDPOINT=https://hf-mirror.com`, `HF_HUB_DISABLE_XET=1`, and **unset** `http_proxy` / `https_proxy` / `ALL_PROXY`. Direct `huggingface.co` times out; the local proxy + Xet path is unreliable. Canonical note: repo-root [`AGENTS.md`](../../../AGENTS.md) § Gotchas.
 
 ## Related skills
 

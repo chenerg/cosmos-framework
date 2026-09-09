@@ -186,12 +186,14 @@ action_policy_droid_edge = LazyDict(
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_droid",
-            max_samples_per_batch=1,  # one whole episode per micro-batch; override via TOML
+            # Token-pack whole episodes. Mutually exclusive with a count cap;
+            # a TOML max_samples_per_batch override must null this field.
+            max_samples_per_batch=None,
             # Pre-expansion token cap (UND+vis+action). Index drop uses
             # max_pre_tf_tokens=48000 (~2257 frames at 256p with extra=500).
             # Keep packing lookahead tiny so a near-full batch does not
             # buffer extra decoded whole-episode videos (default is 10).
-            max_sequence_length=None,
+            max_sequence_length=48000,
             lookahead_limit=1,
             patch_spatial=2,
             sound_latent_fps=0,

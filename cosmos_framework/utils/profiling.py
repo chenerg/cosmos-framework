@@ -17,6 +17,13 @@ from cosmos_framework.utils.easy_io import easy_io
 MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
 
 
+def _use_npu_profiler() -> bool:
+    """Prefer torch_npu.profiler when this process is on Ascend."""
+    if os.environ.get("COSMOS_DEVICE", "").lower() == "npu":
+        return True
+    return bool(hasattr(torch, "npu") and torch.npu.is_available())
+
+
 @contextlib.contextmanager
 def maybe_enable_profiling(config, *, global_step: int = 0):
     # get user defined profiler settings
@@ -29,42 +36,74 @@ def maybe_enable_profiling(config, *, global_step: int = 0):
             os.makedirs(trace_dir, exist_ok=True)
 
         rank = distributed.get_rank()
-
-        def trace_handler(prof):
-            curr_trace_dir_name = "iteration_" + str(prof.step_num)
-            curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
-            if not os.path.exists(curr_trace_dir):
-                os.makedirs(curr_trace_dir, exist_ok=True)
-
-            log.info(f"Dumping traces at step {prof.step_num}")
-            begin = time.monotonic()
-            if rank in config.trainer.profiling.target_ranks:
-                prof.export_chrome_trace(f"{curr_trace_dir}/rank{rank}_trace.json.gz")
-            log.info(f"Finished dumping traces in {time.monotonic() - begin:.2f} seconds")
-
-        log.info(f"Profiling active. Traces will be saved at {trace_dir}")
-
-        if not os.path.exists(trace_dir):
-            os.makedirs(trace_dir, exist_ok=True)
-
         warmup, active = config.trainer.profiling.profile_warmup, 1
         wait = profile_freq - (active + warmup)
         assert wait >= 0, "profile_freq must be greater than or equal to warmup + active"
 
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
-            on_trace_ready=trace_handler,
-            record_shapes=config.trainer.profiling.record_shape,
-            profile_memory=config.trainer.profiling.profile_memory,
-            with_stack=config.trainer.profiling.with_stack,
-            with_modules=config.trainer.profiling.with_modules,
-        ) as torch_profiler:
-            torch_profiler.step_num = global_step
-            yield torch_profiler
+        if not os.path.exists(trace_dir):
+            os.makedirs(trace_dir, exist_ok=True)
+
+        # Non-target ranks skip the profiler so dump/analysis stays on one rank.
+        if rank not in config.trainer.profiling.target_ranks:
+            log.info(f"Profiling skipped on rank {rank} (not in target_ranks)")
+            yield None
+            return
+
+        log.info(f"Profiling active. Traces will be saved at {trace_dir}")
+
+        if _use_npu_profiler():
+            import torch_npu.profiler as npu_profiler
+
+            npu_ready = npu_profiler.tensorboard_trace_handler(dir_name=trace_dir, analyse_flag=True)
+
+            def npu_trace_handler(prof):
+                log.info(f"Dumping NPU traces at step {prof.step_num}")
+                begin = time.monotonic()
+                npu_ready(prof)
+                log.info(f"Finished dumping NPU traces in {time.monotonic() - begin:.2f} seconds")
+
+            with npu_profiler.profile(
+                activities=[npu_profiler.ProfilerActivity.CPU, npu_profiler.ProfilerActivity.NPU],
+                schedule=npu_profiler.schedule(wait=wait, warmup=warmup, active=active),
+                on_trace_ready=npu_trace_handler,
+                record_shapes=config.trainer.profiling.record_shape,
+                profile_memory=config.trainer.profiling.profile_memory,
+                with_stack=config.trainer.profiling.with_stack,
+                with_modules=config.trainer.profiling.with_modules,
+                experimental_config=npu_profiler._ExperimentalConfig(
+                    profiler_level=npu_profiler.ProfilerLevel.Level1,
+                    export_type=npu_profiler.ExportType.Text,
+                ),
+            ) as torch_profiler:
+                torch_profiler.step_num = global_step
+                yield torch_profiler
+        else:
+
+            def trace_handler(prof):
+                curr_trace_dir_name = "iteration_" + str(prof.step_num)
+                curr_trace_dir = os.path.join(trace_dir, curr_trace_dir_name)
+                if not os.path.exists(curr_trace_dir):
+                    os.makedirs(curr_trace_dir, exist_ok=True)
+
+                log.info(f"Dumping traces at step {prof.step_num}")
+                begin = time.monotonic()
+                prof.export_chrome_trace(f"{curr_trace_dir}/rank{rank}_trace.json.gz")
+                log.info(f"Finished dumping traces in {time.monotonic() - begin:.2f} seconds")
+
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active),
+                on_trace_ready=trace_handler,
+                record_shapes=config.trainer.profiling.record_shape,
+                profile_memory=config.trainer.profiling.profile_memory,
+                with_stack=config.trainer.profiling.with_stack,
+                with_modules=config.trainer.profiling.with_modules,
+            ) as torch_profiler:
+                torch_profiler.step_num = global_step
+                yield torch_profiler
     else:
         torch_profiler = contextlib.nullcontext()
         yield None

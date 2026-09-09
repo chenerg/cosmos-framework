@@ -21,7 +21,10 @@ from cosmos_framework.data.generator.action.action_processing import ActionProce
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
     SequencePlan,
+    TeacherForcingGeometry,
     build_sequence_plans_from_data_batch,
+    build_teacher_forcing_frame_block_ids,
+    map_action_sigmas_from_vision_schedule,
     pack_input_sequence,
 )
 from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
@@ -525,8 +528,9 @@ class OmniMoTModel(ImaginaireModel):
 
     def _derive_include_end_of_generation_token(self) -> bool:
         impl = self.config.joint_attn_implementation
-        assert impl in ("two_way", "three_way"), (
-            f"Invalid joint_attn_implementation: {impl}. Must be 'two_way' or 'three_way'."
+        assert impl in ("two_way", "three_way", "teacher_forcing"), (
+            f"Invalid joint_attn_implementation: {impl}. "
+            "Must be 'two_way', 'three_way', or 'teacher_forcing'."
         )
         return False
 
@@ -800,10 +804,24 @@ class OmniMoTModel(ImaginaireModel):
         """
         return memory_info
 
+    def prepare_teacher_forcing_geometry(
+        self,
+        num_vision_latent_frames: list[int],
+        condition_frame_indexes_vision: list[list[int]] | None = None,
+    ) -> TeacherForcingGeometry | None:
+        """Optional causal geometry sampled before timestep sampling.
+
+        The base model does not use teacher-forcing geometry. Causal subclasses
+        override this to draw one S/K pair per packed sample.
+        """
+        del num_vision_latent_frames, condition_frame_indexes_vision
+        return None
+
     def post_noise_packing_hook(
         self,
         packed_sequence: PackedSequence,
         gen_data_clean: GenerationDataClean,
+        teacher_forcing_geometry: TeacherForcingGeometry | None = None,
     ) -> PackedSequence:
         """Transform packing after ``xt`` replaces ``x0`` and before device transfer.
 
@@ -811,7 +829,7 @@ class OmniMoTModel(ImaginaireModel):
         causal training overrides this hook to attach a separate clean stream
         while preserving the noised vision payload as the supervised stream.
         """
-        del gen_data_clean
+        del gen_data_clean, teacher_forcing_geometry
         return packed_sequence
 
     def training_step(
@@ -881,6 +899,10 @@ class OmniMoTModel(ImaginaireModel):
         # Sample a random noise level (sigma) and corresponding interpolation coefficient ("timesteps" in RF)
         # Apply shift per sample based on each sample's resolution
         num_vision_latent_frames = [x.shape[2] for x in gen_data_clean.x0_tokens_vision]
+        teacher_forcing_geometry = self.prepare_teacher_forcing_geometry(
+            num_vision_latent_frames,
+            [plan.condition_frame_indexes_vision for plan in sequence_plans],
+        )
         timesteps_vision, sigmas_vision = self._get_train_noise_level_vision(
             batch_size=gen_data_clean.batch_size,
             is_image_batch=gen_data_clean.is_image_batch,
@@ -888,6 +910,7 @@ class OmniMoTModel(ImaginaireModel):
             num_vision_latent_frames=num_vision_latent_frames,
             num_tokens=num_tokens_per_sample,
             iteration=iteration,
+            teacher_forcing_geometry=teacher_forcing_geometry,
         )  # [B, T_vis] each
 
         # Optional independent action schedule (sampled from rectified_flow_action with
@@ -909,6 +932,22 @@ class OmniMoTModel(ImaginaireModel):
             idx = torch.tensor(action_sample_indices, dtype=torch.long)  # [n_action]
             timesteps_action = ts_full[idx]  # [n_action, 1]
             sigmas_action = sg_full[idx]  # [n_action, 1]
+        elif (
+            teacher_forcing_geometry is not None
+            and action_sample_indices
+            and gen_data_clean.x0_tokens_action is not None
+        ):
+            action_lengths = [token.shape[0] for token in gen_data_clean.x0_tokens_action]
+            assert self.tokenizer_vision_gen is not None
+            sigmas_action = map_action_sigmas_from_vision_schedule(
+                sigmas_vision,
+                action_sample_indices=action_sample_indices,
+                action_lengths=action_lengths,
+                num_vision_latent_frames=num_vision_latent_frames,
+                temporal_compression_factor=self.tokenizer_vision_gen.temporal_compression_factor,
+            )
+            max_timestep = self.rectified_flow_video.noise_scheduler.config.num_train_timesteps
+            timesteps_action = sigmas_action * max_timestep
         else:
             timesteps_action, sigmas_action = (None, None)
 
@@ -974,13 +1013,21 @@ class OmniMoTModel(ImaginaireModel):
         if timesteps_action is not None and packed_sequence.action is not None:
             action_has_noisy_tokens = any(nfi.numel() > 0 for nfi in packed_sequence.action.noisy_frame_indexes)
             if action_has_noisy_tokens:
-                sample_ts = timesteps_action.squeeze(1).cpu()  # [n_action]
-                packed_sequence.action.timesteps = torch.cat(
-                    [
-                        sample_ts[i : i + 1].expand(nfi.numel())
-                        for i, nfi in enumerate(packed_sequence.action.noisy_frame_indexes)
-                    ]
-                ).to(dtype=torch.float32)  # [N_action_noisy]
+                if timesteps_action.ndim == 1 or timesteps_action.shape[-1] == 1:
+                    sample_ts = timesteps_action.reshape(timesteps_action.shape[0]).cpu()  # [n_action]
+                    packed_sequence.action.timesteps = torch.cat(
+                        [
+                            sample_ts[i : i + 1].expand(nfi.numel())
+                            for i, nfi in enumerate(packed_sequence.action.noisy_frame_indexes)
+                        ]
+                    ).to(dtype=torch.float32)  # [N_action_noisy]
+                else:
+                    packed_sequence.action.timesteps = torch.cat(
+                        [
+                            timesteps_action[i, nfi.to(device=timesteps_action.device)].cpu()
+                            for i, nfi in enumerate(packed_sequence.action.noisy_frame_indexes)
+                        ]
+                    ).to(dtype=torch.float32)
             else:
                 timesteps_action, sigmas_action = (None, None)
 
@@ -1028,7 +1075,9 @@ class OmniMoTModel(ImaginaireModel):
             iteration=iteration,
         )
         self._replace_clean_with_noised(packed_sequence, gen_data_noised)
-        packed_sequence = self.post_noise_packing_hook(packed_sequence, gen_data_clean)
+        packed_sequence = self.post_noise_packing_hook(
+            packed_sequence, gen_data_clean, teacher_forcing_geometry
+        )
 
         # Move packed sequence to CUDA
         packed_sequence.to_cuda()
@@ -1114,7 +1163,7 @@ class OmniMoTModel(ImaginaireModel):
                 Under rectified flow the target is ``v = eps - x0``.
             condition_mask: Mask where 1 = clean/conditioning, 0 = noisy/generation (list of tensors).
             timesteps: Diffusion timesteps for time weighting. Shape [B,1] for
-                base/teacher_forcing (all frames share one timestep) or [B,T_max]
+                base training (all frames share one timestep) or [B,T_max]
                 for diffusion_forcing (per-frame independent timesteps). Time weights
                 are applied per-frame before averaging, so non-uniform weight functions
                 are handled correctly.
@@ -1320,6 +1369,7 @@ class OmniMoTModel(ImaginaireModel):
         resolutions: list[str] | str | None = None,
         num_tokens: list[int] | None = None,
         iteration: int | None = None,
+        teacher_forcing_geometry: TeacherForcingGeometry | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample the rectified flow interpolation coefficient (timesteps) and obtain the corresponding
@@ -1330,15 +1380,17 @@ class OmniMoTModel(ImaginaireModel):
             is_image_batch: Whether this is an image batch (vs video).
             num_vision_latent_frames: Per-sample vision latent frame counts [T_0, ..., T_{B-1}].
                          For causal_training_strategy="diffusion_forcing", resamples B*T_max independent
-                         times and returns tensors of shape [B,T_max]. For base/TF strategies, ignored —
-                         returns shape [B,1] (all frames share the same sigma).
+                         times and returns tensors of shape [B,T_max]. For teacher_forcing with
+                         geometry, returns [B,T_max] with σ shared inside each causal block.
+                         For base training, ignored — returns shape [B,1].
             resolutions: Resolution string(s) (e.g., "256", "512") for dict-based shift lookup.
                          Can be a single string (applied to all samples) or a list of strings (one per sample).
                          If None, defaults to self.config.resolution (can be used for other modalities).
             num_tokens: Number of tokens for each sample (before 2x2 merge). Needed for dynamic shift.
+            teacher_forcing_geometry: Per-sample S/K used to expand block σ onto frames.
 
         Returns:
-            (timesteps, sigmas): Both [B,1] for TF/base, or [B,T_max] for diffusion_forcing.
+            (timesteps, sigmas): Both [B,1] for base, or [B,T_max] for teacher_forcing/diffusion_forcing.
         """
 
         rectified_flow = self.rectified_flow_image if is_image_batch else self.rectified_flow_video
@@ -1390,8 +1442,37 @@ class OmniMoTModel(ImaginaireModel):
                     shifts_list.append(shift_dict[resolution])
                 shifts = torch.tensor(shifts_list, dtype=torch.float32)
 
-        # Sample noise times: B×T_max for DF (one per video latent frame), B×1 for base/TF
-        if self.config.causal_training_strategy == "diffusion_forcing":
+        # Sample noise times: B×T_max for DF / teacher-forcing block σ, B×1 for base.
+        if self.config.causal_training_strategy == "teacher_forcing" and teacher_forcing_geometry is not None:
+            T_max = max(num_vision_latent_frames)
+            block_counts = []
+            for num_frames, block_size in zip(
+                num_vision_latent_frames, teacher_forcing_geometry.block_sizes, strict=True
+            ):
+                frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, block_size)
+                block_counts.append(int(frame_block_ids[-1].item()) + 1)
+            total_blocks = sum(block_counts)
+            block_shifts = torch.cat(
+                [
+                    shifts[sample_id : sample_id + 1].repeat(block_count)
+                    for sample_id, block_count in enumerate(block_counts)
+                ]
+            )
+            block_sigmas = rectified_flow.sample_train_time(
+                total_blocks, iteration=iteration, shifts=block_shifts
+            ).to(**self.tensor_kwargs_fp32)
+            sigmas = torch.zeros((batch_size, T_max), **self.tensor_kwargs_fp32)
+            block_offset = 0
+            for sample_id, (num_frames, block_size, block_count) in enumerate(
+                zip(num_vision_latent_frames, teacher_forcing_geometry.block_sizes, block_counts, strict=True)
+            ):
+                sample_block_sigmas = block_sigmas[block_offset : block_offset + block_count]
+                frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, block_size).to(
+                    device=sample_block_sigmas.device
+                )
+                sigmas[sample_id, :num_frames] = sample_block_sigmas.index_select(0, frame_block_ids)
+                block_offset += block_count
+        elif self.config.causal_training_strategy == "diffusion_forcing":
             # T_max = max(num_vision_latent_frames) across the batch; trailing entries for shorter
             # sequences are unused (sliced away in _add_noise_to_input).
             T_max = max(num_vision_latent_frames)
@@ -1505,7 +1586,7 @@ class OmniMoTModel(ImaginaireModel):
         Args:
             gen_data_clean (GenerationDataClean): The input dataclass containing the clean data *latents* (tokens).
             packed_sequence (PackedSequence): Packed sequence with condition masks attached to modalities.
-            sigmas (torch.Tensor): The noise levels. Shape [B,1] for base/teacher_forcing (all video
+            sigmas (torch.Tensor): The noise levels. Shape [B,1] for base training (all video
                 latent frames share the same sigma) or [B,T_max] for diffusion_forcing (per-latent-frame
                 independent sigma). T_max is the number of video latent frames (temporally compressed
                 tokens), not RGB frames. In all modes, sigmas are multiplied by (1 - condition_mask)
@@ -2039,7 +2120,7 @@ class OmniMoTModel(ImaginaireModel):
             self.parallel_dims.cp_enabled or self.parallel_dims.cfgp_enabled or self.parallel_dims.dp_shard_enabled
         ):
             return False
-        if self.config.joint_attn_implementation != "two_way":
+        if self.config.joint_attn_implementation not in {"two_way", "teacher_forcing"}:
             return False
         if self.config.video_temporal_causal:
             return False

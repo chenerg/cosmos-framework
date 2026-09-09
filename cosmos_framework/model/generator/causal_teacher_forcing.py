@@ -9,8 +9,9 @@ import torch
 
 from cosmos_framework.data.generator.sequence_packing import (
     PackedSequence,
+    TeacherForcingGeometry,
     expand_packed_sequence_for_teacher_forcing,
-    sample_teacher_forcing_parameters,
+    sample_teacher_forcing_geometry,
 )
 
 
@@ -19,6 +20,7 @@ class _ParallelismConfig(Protocol):
 
 
 class TeacherForcingConfig(Protocol):
+    joint_attn_implementation: str
     causal_training_strategy: str
     vision_gen: bool
     action_gen: bool
@@ -39,6 +41,11 @@ def validate_teacher_forcing_config(config: TeacherForcingConfig) -> None:
         raise ValueError(
             "OmniMoTCausalModel requires causal_training_strategy='teacher_forcing', "
             f"got {config.causal_training_strategy!r}"
+        )
+    if config.joint_attn_implementation != "teacher_forcing":
+        raise ValueError(
+            "OmniMoTCausalModel requires joint_attn_implementation='teacher_forcing', "
+            f"got {config.joint_attn_implementation!r}"
         )
     if not config.vision_gen:
         raise ValueError("OmniMoTCausalModel requires vision_gen=True")
@@ -71,33 +78,50 @@ def validate_teacher_forcing_config(config: TeacherForcingConfig) -> None:
         )
 
 
-def expand_teacher_forcing_training_sequence(
-    packed_sequence: PackedSequence,
+def prepare_teacher_forcing_geometry(
     *,
-    clean_vision_tokens: list[torch.Tensor],
+    num_samples: int,
     config: TeacherForcingConfig,
-    clean_action_tokens: list[torch.Tensor] | None = None,
-    temporal_compression_factor: int | None = None,
     generator: torch.Generator | None = None,
-) -> PackedSequence:
-    """Sample batch-shared S/K and expand an already-noised video(+action) sequence."""
+) -> TeacherForcingGeometry:
+    """Independently sample one block/history pair per packed sample."""
 
     validate_teacher_forcing_config(config)
-    if packed_sequence.is_image_batch:
-        raise ValueError("teacher-forcing causal training currently requires a video batch")
-
-    block_size, history_blocks = sample_teacher_forcing_parameters(
+    return sample_teacher_forcing_geometry(
+        num_samples=num_samples,
         block_size_min=config.teacher_forcing_block_size_min,
         block_size_max=config.teacher_forcing_block_size_max,
         history_blocks_min=config.teacher_forcing_history_blocks_min,
         history_blocks_max=config.teacher_forcing_history_blocks_max,
         generator=generator,
     )
+
+
+def expand_teacher_forcing_training_sequence(
+    packed_sequence: PackedSequence,
+    *,
+    clean_vision_tokens: list[torch.Tensor],
+    config: TeacherForcingConfig,
+    geometry: TeacherForcingGeometry | None = None,
+    clean_action_tokens: list[torch.Tensor] | None = None,
+    temporal_compression_factor: int | None = None,
+    generator: torch.Generator | None = None,
+) -> PackedSequence:
+    """Expand an already-noised video(+action) sequence with sampled geometry."""
+
+    validate_teacher_forcing_config(config)
+    if packed_sequence.is_image_batch:
+        raise ValueError("teacher-forcing causal training currently requires a video batch")
+    if geometry is None:
+        geometry = prepare_teacher_forcing_geometry(
+            num_samples=len(clean_vision_tokens),
+            config=config,
+            generator=generator,
+        )
     return expand_packed_sequence_for_teacher_forcing(
         packed_sequence,
         clean_vision_tokens=clean_vision_tokens,
-        block_size=block_size,
-        history_blocks=history_blocks,
+        geometry=geometry,
         clean_action_tokens=clean_action_tokens,
         temporal_compression_factor=temporal_compression_factor,
     )

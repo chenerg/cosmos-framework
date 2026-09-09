@@ -105,6 +105,30 @@ class TeacherForcingAttentionInfo(SplitInfo):
 
 AttentionMaskType = SplitInfo
 
+JOINT_ATTN_IMPLEMENTATIONS = frozenset({"two_way", "three_way", "teacher_forcing"})
+
+
+def resolve_runtime_joint_attn_implementation(
+    configured_implementation: str,
+    *,
+    has_teacher_forcing_layout: bool,
+) -> str:
+    """Resolve a configured topology for the current packed sequence.
+
+    Teacher forcing is a training-only topology. Denoising and validation
+    sequences have no clean/noisy dual-stream layout, so the same model uses
+    its ordinary two-way topology for those sequences.
+    """
+
+    if configured_implementation not in JOINT_ATTN_IMPLEMENTATIONS:
+        raise ValueError(
+            f"Invalid joint_attn_implementation: {configured_implementation}. "
+            f"Must be one of {sorted(JOINT_ATTN_IMPLEMENTATIONS)}."
+        )
+    if configured_implementation == "teacher_forcing" and not has_teacher_forcing_layout:
+        return "two_way"
+    return configured_implementation
+
 
 _SPLIT_INFO_ATTRIBUTES = (
     "max_causal_len",
@@ -688,11 +712,14 @@ def build_packed_sequence(
     """
     device = packed_sequence.device
     natten_metadata_list = None
-    if joint_attn_implementation not in {"two_way", "three_way"}:
+    if joint_attn_implementation not in JOINT_ATTN_IMPLEMENTATIONS:
         raise ValueError(
-            f"Invalid joint_attn_implementation: {joint_attn_implementation}. Must be 'two_way' or 'three_way'."
+            f"Invalid joint_attn_implementation: {joint_attn_implementation}. "
+            f"Must be one of {sorted(JOINT_ATTN_IMPLEMENTATIONS)}."
         )
-    if teacher_forcing_layout is not None:
+    if joint_attn_implementation == "teacher_forcing":
+        if teacher_forcing_layout is None:
+            raise ValueError("teacher_forcing attention requires teacher_forcing_layout")
         if cp_world_size != 1:
             raise ValueError("teacher-forcing Dense attention does not support context parallelism")
         if (
@@ -724,9 +751,14 @@ def build_packed_sequence(
             attn_modes=attn_modes,
             sample_lens=sample_lens,
             actual_len=int(packed_sequence.shape[0]),
-            is_three_way=joint_attn_implementation == "three_way",
+            is_three_way=False,
         )
         make_pack = sequence_pack_from_packed_sequence
+    elif teacher_forcing_layout is not None:
+        raise ValueError(
+            "teacher_forcing_layout requires joint_attn_implementation='teacher_forcing', "
+            f"got {joint_attn_implementation!r}"
+        )
     elif joint_attn_implementation == "two_way":
         attention_meta = SplitInfo(
             split_lens=split_lens,

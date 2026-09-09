@@ -9,19 +9,26 @@ from cosmos_framework.configs.base.defaults.model import (
 )
 from cosmos_framework.model.generator.omni_mot_causal_model import OmniMoTCausalModel
 from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+from cosmos_framework.utils.lazy_config.registry import locate
+
+
+def _resolve_target(target):
+    """Pytest stringifies LazyCall ``_target_`` via conftest ``_CONVERT_TARGET_TO_STRING``."""
+    return locate(target) if isinstance(target, str) else target
 
 
 def test_causal_model_groups_select_causal_subclass_without_changing_base_groups():
-    assert MOT_DDP_CONFIG["model"]["_target_"] is OmniMoTModel
-    assert MOT_FSDP_CONFIG["model"]["_target_"] is OmniMoTModel
-    assert MOT_CAUSAL_DDP_CONFIG["model"]["_target_"] is OmniMoTCausalModel
-    assert MOT_CAUSAL_FSDP_CONFIG["model"]["_target_"] is OmniMoTCausalModel
+    assert _resolve_target(MOT_DDP_CONFIG["model"]["_target_"]) is OmniMoTModel
+    assert _resolve_target(MOT_FSDP_CONFIG["model"]["_target_"]) is OmniMoTModel
+    assert _resolve_target(MOT_CAUSAL_DDP_CONFIG["model"]["_target_"]) is OmniMoTCausalModel
+    assert _resolve_target(MOT_CAUSAL_FSDP_CONFIG["model"]["_target_"]) is OmniMoTCausalModel
 
 
 def test_causal_model_groups_enable_teacher_forcing():
     for group in (MOT_CAUSAL_DDP_CONFIG, MOT_CAUSAL_FSDP_CONFIG):
         config = group["model"]["config"]
         assert config.causal_training_strategy == "teacher_forcing"
+        assert config.joint_attn_implementation == "teacher_forcing"
         assert config.teacher_forcing_block_size_min == 1
         assert config.teacher_forcing_block_size_max == 4
         assert config.teacher_forcing_history_blocks_min == 1

@@ -34,10 +34,10 @@ def compute_flow_matching_loss(
             Under rectified flow the target is ``v = eps - x0``.
         condition_mask: Mask where 1 = clean/conditioning, 0 = noisy/generation (list of tensors).
         timesteps: Diffusion timesteps for time weighting. Shape [B,1] for
-            base/teacher_forcing (all frames share one timestep) or [B,T_max]
-            for diffusion_forcing (per-frame independent timesteps). Time weights
-            are applied per-frame before averaging, so non-uniform weight functions
-            are handled correctly.
+            base training, or [B,T_max] for teacher_forcing (σ shared inside
+            each causal block) and diffusion_forcing (independent per frame).
+            Time weights are applied per-frame before averaging, so non-uniform
+            weight functions are handled correctly.
         has_valid_tokens: Whether this modality has valid noisy tokens.
         rectified_flow: The rectified flow object for time weighting.
         tensor_kwargs_fp32: Dict of dtype/device kwargs forwarded to

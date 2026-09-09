@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import tomllib
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from cosmos_framework.configs.toml_config.toml_config_helper import (
     TASK_TO_BASE_CONFIG,
@@ -359,12 +359,13 @@ class ModelConfig(BaseModel):
             "256-token causal UND blocks plus block-level CLEAN/NOISY rows."
         ),
     )
-    joint_attn_implementation: str = Field(
+    joint_attn_implementation: Literal["two_way", "three_way", "teacher_forcing"] = Field(
         default="two_way",
         description=(
             "VFM attention layout: 'two_way' (separate U/G blocks with "
             "cross-attention), 'three_way' (adds a sparsity-aware third "
-            "block — NATTEN), or 'flex' (legacy). Used when "
+            "block — NATTEN), or 'teacher_forcing' (causal UND plus explicitly "
+            "masked CLEAN/NOISY streams during training, with two-way inference). Used when "
             "[job].task='vfm'; skipped on VLM."
         ),
     )
@@ -733,6 +734,45 @@ class SFTExperimentConfig(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _vfm_packing_caps_xor(self) -> SFTExperimentConfig:
+        """VFM PackingDataLoader is XOR on the two caps. VLM may set both."""
+        if self.job.task != "vfm":
+            return self
+        samples = self.dataloader_train.max_samples_per_batch
+        seq = self.dataloader_train.max_sequence_length
+        if samples is not None and seq is not None:
+            raise ValueError(
+                "VFM PackingDataLoader requires exactly one of "
+                "[dataloader_train].max_samples_per_batch or "
+                "[dataloader_train].max_sequence_length; "
+                f"got both max_samples_per_batch={samples} and "
+                f"max_sequence_length={seq}."
+            )
+        return self
+
+
+def _clear_other_vfm_packing_cap(raw: dict[str, Any], task: str) -> None:
+    """If a VFM TOML sets one packing cap, emit ``null`` for the other.
+
+    PackingDataLoader asserts XOR. Experiment defaults may already set the
+    other cap; omitted TOML keys would leave it in place and training would
+    fail at dataloader init.
+    """
+    if task != "vfm":
+        return
+    dl = raw.get("dataloader_train")
+    if not isinstance(dl, dict):
+        return
+    has_samples = dl.get("max_samples_per_batch") is not None
+    has_seq = dl.get("max_sequence_length") is not None
+    if has_samples == has_seq:
+        return
+    if has_samples:
+        dl["max_sequence_length"] = None
+    else:
+        dl["max_samples_per_batch"] = None
+
 
 # ---------------------------------------------------------------------------
 # End-to-end loader: TOML → validate → Hydra overrides → merged Config.
@@ -785,6 +825,10 @@ def load_experiment_from_toml(
     raw.setdefault("job", {})["upload_reproducible_setup"] = cfg.job.upload_reproducible_setup
 
     task = raw.get("job", {}).get("task", "vfm")
+    # Omitted TOML keys do not emit Hydra overrides, so a count-cap TOML would
+    # otherwise leave the experiment's max_sequence_length in place (and vice
+    # versa). Clear the other cap so VFM packing stays XOR.
+    _clear_other_vfm_packing_cap(raw, task)
     try:
         base_config_path = TASK_TO_BASE_CONFIG[task]
     except KeyError as e:

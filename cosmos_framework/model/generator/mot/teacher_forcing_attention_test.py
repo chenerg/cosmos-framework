@@ -31,6 +31,7 @@ from cosmos_framework.model.generator.mot.attention import (
     TeacherForcingAttentionInfo,
     build_packed_sequence,
     dispatch_attention,
+    resolve_runtime_joint_attn_implementation,
 )
 from cosmos_framework.model.generator.mot.teacher_forcing_attention import (
     teacher_forcing_dense_attention,
@@ -144,7 +145,7 @@ def _make_teacher_forcing_packs(dense_mode: str = "global"):
     key = torch.randn(sum(layout.sample_lens), 2, 3, generator=generator)
     value = torch.randn(sum(layout.sample_lens), 2, 3, generator=generator)
     common_kwargs = dict(
-        joint_attn_implementation="three_way",
+        joint_attn_implementation="teacher_forcing",
         attn_modes=list(layout.attn_modes),
         split_lens=list(layout.split_lens),
         sample_lens=list(layout.sample_lens),
@@ -375,12 +376,43 @@ def test_build_packed_sequence_rejects_teacher_forcing_layout_geometry_mismatch(
 
     with pytest.raises(ValueError, match="layout geometry"):
         build_packed_sequence(
-            "three_way",
+            "teacher_forcing",
             packed_sequence=packed_sequence,
             attn_modes=["causal", "full"],
             split_lens=[2, 3],
             sample_lens=[5],
             packed_und_token_indexes=torch.tensor([0]),
+            packed_gen_token_indexes=layout.gen_query_indexes,
+            num_heads=2,
+            head_dim=4,
+            num_layers=1,
+            teacher_forcing_layout=layout,
+        )
+
+
+def test_resolve_runtime_joint_attn_implementation_falls_back_without_layout():
+    assert resolve_runtime_joint_attn_implementation("teacher_forcing", has_teacher_forcing_layout=True) == "teacher_forcing"
+    assert resolve_runtime_joint_attn_implementation("teacher_forcing", has_teacher_forcing_layout=False) == "two_way"
+    assert resolve_runtime_joint_attn_implementation("two_way", has_teacher_forcing_layout=False) == "two_way"
+
+
+def test_build_packed_sequence_rejects_layout_under_two_way():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(2, 1, 1)],
+        block_size=1,
+        history_blocks=1,
+    )
+    packed_sequence = torch.randn(sum(layout.sample_lens), 2, 4)
+
+    with pytest.raises(ValueError, match="teacher_forcing"):
+        build_packed_sequence(
+            "two_way",
+            packed_sequence=packed_sequence,
+            attn_modes=list(layout.attn_modes),
+            split_lens=list(layout.split_lens),
+            sample_lens=list(layout.sample_lens),
+            packed_und_token_indexes=torch.nonzero(layout.stream_ids == -1, as_tuple=True)[0],
             packed_gen_token_indexes=layout.gen_query_indexes,
             num_heads=2,
             head_dim=4,

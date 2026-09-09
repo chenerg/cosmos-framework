@@ -10,8 +10,17 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from cosmos_framework.configs.toml_config.sft_config import SFTExperimentConfig
+from cosmos_framework.configs.toml_config.sft_config import (
+    SFTExperimentConfig,
+    _clear_other_vfm_packing_cap,
+)
 from cosmos_framework.configs.toml_config.toml_config_helper import build_hydra_overrides
+from cosmos_framework.utils.lazy_config.registry import locate
+
+
+def _resolve_target(target):
+    """Hydra/LazyCall may store ``_target_`` as a class or a qualified-name string."""
+    return locate(target) if isinstance(target, str) else target
 
 # Representative payload: scalars, a nested sub-table, and an array-of-tables.
 _CUSTOM_PAYLOAD = {
@@ -50,6 +59,49 @@ class TestSchemaValidation:
         assert cfg.model.causal_training_strategy == "teacher_forcing"
         assert cfg.model.teacher_forcing_dense_mode == "per_sample"
         assert cfg.model.teacher_forcing_visualize_sdpa_mask is True
+
+    def test_vfm_rejects_both_packing_caps(self) -> None:
+        with pytest.raises(ValidationError, match="exactly one of"):
+            SFTExperimentConfig.model_validate(
+                {
+                    "job": {"task": "vfm", "experiment": "action_policy_droid_edge"},
+                    "dataloader_train": {
+                        "max_samples_per_batch": 1,
+                        "max_sequence_length": 48000,
+                    },
+                }
+            )
+
+    def test_vlm_allows_both_packing_caps(self) -> None:
+        cfg = SFTExperimentConfig.model_validate(
+            {
+                "job": {"task": "vlm", "experiment": "llava_ov"},
+                "dataloader_train": {
+                    "max_samples_per_batch": 1,
+                    "max_sequence_length": 16000,
+                },
+            }
+        )
+        assert cfg.dataloader_train.max_samples_per_batch == 1
+        assert cfg.dataloader_train.max_sequence_length == 16000
+
+    def test_vfm_count_cap_clears_sequence_cap_override(self) -> None:
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_policy_droid_edge"},
+            "dataloader_train": {"max_samples_per_batch": 1},
+        }
+        _clear_other_vfm_packing_cap(raw, "vfm")
+        assert raw["dataloader_train"]["max_samples_per_batch"] == 1
+        assert raw["dataloader_train"]["max_sequence_length"] is None
+
+    def test_vfm_sequence_cap_clears_count_cap_override(self) -> None:
+        raw = {
+            "job": {"task": "vfm", "experiment": "action_policy_droid_edge"},
+            "dataloader_train": {"max_sequence_length": 48000},
+        }
+        _clear_other_vfm_packing_cap(raw, "vfm")
+        assert raw["dataloader_train"]["max_sequence_length"] == 48000
+        assert raw["dataloader_train"]["max_samples_per_batch"] is None
 
     def test_custom_section_validates_arbitrary_nested_content(self) -> None:
         """Arbitrary nested [custom] content passes through untouched."""
@@ -244,12 +296,13 @@ class TestEndToEndLoader:
             ],
         )
 
-        assert config.model._target_ is OmniMoTCausalModel
+        assert _resolve_target(config.model._target_) is OmniMoTCausalModel
         assert config.job.name == "vision_causal_smoke_edge"
         assert config.trainer.distributed_parallelism == "ddp"
         assert config.trainer.max_iter == 3
         assert config.model.config.precision == "bfloat16"
         assert config.model.config.causal_training_strategy == "teacher_forcing"
+        assert config.model.config.joint_attn_implementation == "teacher_forcing"
         assert config.model.config.teacher_forcing_block_size_min == 1
         assert config.model.config.teacher_forcing_block_size_max == 4
         assert config.model.config.teacher_forcing_history_blocks_min == 1
@@ -284,6 +337,7 @@ experiment = "vision_sft_nano"
 
 [model]
 causal_training_strategy                 = "teacher_forcing"
+joint_attn_implementation                = "teacher_forcing"
 teacher_forcing_block_size_min           = 1
 teacher_forcing_block_size_max           = 4
 teacher_forcing_history_blocks_min       = 1
@@ -299,8 +353,9 @@ load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
 
         config = _load_or_skip(toml_path, extra_overrides=["model=mot_causal_fsdp"])
 
-        assert config.model._target_ is OmniMoTCausalModel
+        assert _resolve_target(config.model._target_) is OmniMoTCausalModel
         assert config.model.config.causal_training_strategy == "teacher_forcing"
+        assert config.model.config.joint_attn_implementation == "teacher_forcing"
         assert config.model.config.teacher_forcing_block_size_min == 1
         assert config.model.config.teacher_forcing_block_size_max == 4
         assert config.model.config.teacher_forcing_history_blocks_min == 1

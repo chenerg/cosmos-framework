@@ -28,6 +28,7 @@ def _config(**overrides):
         teacher_forcing_history_blocks_min=3,
         teacher_forcing_history_blocks_max=3,
         teacher_forcing_dense_mode="global",
+        joint_attn_implementation="teacher_forcing",
         parallelism=SimpleNamespace(context_parallel_shard_degree=1),
     )
     values.update(overrides)
@@ -107,6 +108,7 @@ def _packed_noisy_video_action() -> PackedSequence:
         ({"teacher_forcing_history_blocks_min": 4, "teacher_forcing_history_blocks_max": 3}, "history_blocks"),
         ({"teacher_forcing_dense_mode": "invalid"}, "dense_mode"),
         ({"parallelism": SimpleNamespace(context_parallel_shard_degree=2)}, "context parallel"),
+        ({"joint_attn_implementation": "two_way"}, "joint_attn_implementation"),
     ],
 )
 def test_validate_teacher_forcing_config_rejects_unsupported_settings(overrides, error: str):
@@ -125,8 +127,8 @@ def test_expand_teacher_forcing_training_sequence_uses_configured_batch_shared_g
     )
 
     assert expanded.teacher_forcing is not None
-    assert expanded.teacher_forcing.layout.block_size == 2
-    assert expanded.teacher_forcing.layout.history_blocks == 3
+    assert expanded.teacher_forcing.layout.geometry.block_sizes == (2,)
+    assert expanded.teacher_forcing.layout.geometry.history_blocks == (3,)
     assert expanded.teacher_forcing.clean_vision_tokens == clean
     assert expanded.vision is not None
     assert expanded.vision.tokens == packed.vision.tokens
@@ -160,19 +162,19 @@ def test_expand_teacher_forcing_training_sequence_supports_vision_action():
 
     assert expanded.teacher_forcing is not None
     layout = expanded.teacher_forcing.layout
-    # S=2: vision frame blocks [0,0,1]; action latent frames ceil(j/2)=[0,1,1,2,2]
-    # give action blocks [0,0,0,1,1]. Interleaved GEN order per stream:
-    # [V0 V1 A0 A1 A2 | V2 A3 A4].
-    assert layout.block_ids.tolist() == [-1] + [0, 0, 0, 0, 0, 1, 1, 1] * 2
-    assert layout.source_sequence_indexes.tolist() == [0] + [1, 2, 4, 5, 6, 3, 7, 8] * 2
-    assert layout.clean_token_indexes.tolist() == [1, 2, 6]
-    assert layout.clean_action_token_indexes.tolist() == [3, 4, 5, 7, 8]
-    assert layout.noisy_output_indexes.tolist() == [9, 10, 14, 11, 12, 13, 15, 16]
-    assert layout.noisy_action_output_indexes.tolist() == [11, 12, 13, 15, 16]
+    # S=2: vision frame blocks [0 | 1 1]; action latent frames ceil(j/2)=[0,1,1,2,2]
+    # give action blocks [0,1,1,1,1]. Interleaved GEN order per stream:
+    # [V0 A0 | V1 V2 A1 A2 A3 A4].
+    assert layout.block_ids.tolist() == [-1] + [0, 0, 1, 1, 1, 1, 1, 1] * 2
+    assert layout.source_sequence_indexes.tolist() == [0] + [1, 4, 2, 3, 5, 6, 7, 8] * 2
+    assert layout.clean_token_indexes.tolist() == [1, 3, 4]
+    assert layout.clean_action_token_indexes.tolist() == [2, 5, 6, 7, 8]
+    assert layout.noisy_output_indexes.tolist() == [9, 11, 12, 10, 13, 14, 15, 16]
+    assert layout.noisy_action_output_indexes.tolist() == [10, 13, 14, 15, 16]
     assert expanded.vision is not None and expanded.action is not None
-    assert expanded.vision.sequence_indexes.tolist() == [9, 10, 14]
-    assert expanded.action.sequence_indexes.tolist() == [11, 12, 13, 15, 16]
-    assert expanded.action.mse_loss_indexes.tolist() == [11, 12, 13, 15, 16]
+    assert expanded.vision.sequence_indexes.tolist() == [9, 11, 12]
+    assert expanded.action.sequence_indexes.tolist() == [10, 13, 14, 15, 16]
+    assert expanded.action.mse_loss_indexes.tolist() == [10, 13, 14, 15, 16]
     assert expanded.teacher_forcing.clean_action_tokens == clean_action
     assert torch.equal(
         expanded.position_ids[:, layout.clean_action_token_indexes],

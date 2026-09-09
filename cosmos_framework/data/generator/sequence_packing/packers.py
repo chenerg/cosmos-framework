@@ -365,10 +365,27 @@ def pack_input_sequence(
                 action_fps = _get_optional_fps(gen_data_clean.fps_action, idx_action)
                 idx_action += 1
 
+                action_timestep = input_timestep
+                if (
+                    sequence_plan.has_vision
+                    and isinstance(input_timestep, torch.Tensor)
+                    and input_timestep.numel() > 1
+                ):
+                    from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
+                        assign_action_steps_to_latent_frames,
+                    )
+
+                    t_vis = input_vision_tokens.shape[2]
+                    t_action = input_action_tokens.shape[0]
+                    latent_frames = assign_action_steps_to_latent_frames(
+                        t_action, t_vis, temporal_compression_factor
+                    )
+                    action_timestep = input_timestep[latent_frames]
+
                 action_split_len = seq_builder.pack_action_tokens(
                     input_action_tokens=input_action_tokens,
                     condition_frame_indexes_action=sequence_plan.condition_frame_indexes_action,
-                    input_timestep=input_timestep,
+                    input_timestep=action_timestep,
                     action_temporal_offset=vision_start_temporal_offset,
                     enable_fps_modulation=enable_fps_modulation,
                     base_fps=base_fps,

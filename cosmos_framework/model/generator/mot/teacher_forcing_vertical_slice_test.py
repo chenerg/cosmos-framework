@@ -81,7 +81,7 @@ def _make_network() -> Cosmos3VFMNetwork:
         max_latent_h=1,
         max_latent_w=1,
         max_latent_t=3,
-        joint_attn_implementation="two_way",
+        joint_attn_implementation="teacher_forcing",
     )
     return Cosmos3VFMNetwork(_TinyLanguageModel(), config)
 

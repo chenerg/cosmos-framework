@@ -429,7 +429,12 @@ class PackedSequenceBuilder:
             if frame_idx in condition_set:
                 continue
             action.mse_loss_indexes.extend(frame_indexes)
-            action.timesteps.extend([input_timestep])
+            if isinstance(input_timestep, torch.Tensor):
+                timestep_values = input_timestep.reshape(-1)
+                frame_ts = timestep_values[frame_idx].item() if timestep_values.numel() > 1 else timestep_values.item()
+            else:
+                frame_ts = input_timestep
+            action.timesteps.extend([frame_ts])
 
         return action_split_len
 

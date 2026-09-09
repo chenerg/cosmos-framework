@@ -10,12 +10,16 @@ from cosmos_framework.data.generator.sequence_packing.modality import ModalityDa
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequence
 from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     TeacherForcingData,
+    TeacherForcingGeometry,
     TeacherForcingLayout,
     TeacherForcingStream,
     assign_action_steps_to_latent_frames,
+    map_action_sigmas_from_vision_schedule,
     build_dense_teacher_forcing_gen_mask,
+    build_teacher_forcing_frame_block_ids,
     build_teacher_forcing_layout,
     expand_packed_sequence_for_teacher_forcing,
+    sample_teacher_forcing_geometry,
     sample_teacher_forcing_parameters,
     select_teacher_forcing_noisy_outputs,
 )
@@ -30,8 +34,7 @@ def test_teacher_forcing_stream_values_are_stable():
 def test_teacher_forcing_layout_is_frozen():
     empty = torch.empty(0, dtype=torch.long)
     layout = TeacherForcingLayout(
-        block_size=1,
-        history_blocks=1,
+        geometry=TeacherForcingGeometry(block_sizes=(1,), history_blocks=(1,)),
         original_sample_lens=(),
         sample_lens=(),
         split_lens=(),
@@ -46,7 +49,7 @@ def test_teacher_forcing_layout_is_frozen():
     )
 
     with pytest.raises(FrozenInstanceError):
-        layout.block_size = 2
+        layout.geometry = TeacherForcingGeometry(block_sizes=(2,), history_blocks=(1,))
 
 
 def test_sample_teacher_forcing_parameters_is_reproducible():
@@ -93,7 +96,10 @@ def test_build_teacher_forcing_layout_maps_both_streams_to_the_original_tokens()
     assert layout.source_sequence_indexes.tolist() == [0, 1, 2, 3, 4, 5, 6, 2, 3, 4, 5, 6]
     assert layout.sample_ids.tolist() == [0] * 12
     assert layout.stream_ids.tolist() == [-1, -1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
-    assert layout.block_ids.tolist() == [-1, -1, 0, 0, 1, 1, 2, 0, 0, 1, 1, 2]
+    # Frame 0 is a singleton block; remaining frames are chunked by S=2.
+    assert layout.block_ids.tolist() == [-1, -1, 0, 1, 1, 2, 2, 0, 1, 1, 2, 2]
+    assert layout.geometry.block_sizes == (2,)
+    assert layout.geometry.history_blocks == (1,)
     assert layout.gen_query_indexes.tolist() == list(range(2, 12))
     assert layout.clean_token_indexes.tolist() == list(range(2, 7))
     assert layout.noisy_output_indexes.tolist() == list(range(7, 12))
@@ -136,30 +142,32 @@ def test_build_teacher_forcing_layout_expands_spatial_tokens_and_isolates_sample
         11,
         12,
     ]
+    # Sample 0: T=3,S=2 → blocks [0 | 1 1], 2 spatial tokens per frame.
+    # Sample 1: T=2,S=2 → blocks [0 | 1], 2 spatial tokens per frame.
     assert layout.block_ids.tolist() == [
         -1,
         0,
         0,
-        0,
-        0,
+        1,
+        1,
         1,
         1,
         0,
         0,
-        0,
-        0,
+        1,
+        1,
         1,
         1,
         -1,
         -1,
         0,
         0,
+        1,
+        1,
         0,
         0,
-        0,
-        0,
-        0,
-        0,
+        1,
+        1,
     ]
     assert layout.sample_ids.tolist() == [0] * 13 + [1] * 10
 
@@ -239,9 +247,7 @@ def test_dense_mask_matches_s1_k1_block_causal_matrix():
         history_blocks=1,
     )
 
-    mask = build_dense_teacher_forcing_gen_mask(
-        layout, max_sequence_length=layout.source_sequence_indexes.numel()
-    )
+    mask = build_dense_teacher_forcing_gen_mask(layout)
 
     expected = torch.tensor(
         [
@@ -261,20 +267,40 @@ def test_dense_mask_matches_s1_k1_block_causal_matrix():
 
 
 def test_dense_mask_keeps_blocks_full_and_limits_clean_history_to_k_blocks():
+    num_frames = 5
+    spatial = 2
+    block_size = 2
+    history_blocks = 1
     layout = build_teacher_forcing_layout(
         und_token_counts=[1],
-        vision_token_shapes=[(5, 1, 2)],
-        block_size=2,
-        history_blocks=1,
+        vision_token_shapes=[(num_frames, 1, spatial)],
+        block_size=block_size,
+        history_blocks=history_blocks,
     )
-
-    mask = build_dense_teacher_forcing_gen_mask(
-        layout, max_sequence_length=layout.source_sequence_indexes.numel()
-    )
-
-    assert mask[4].nonzero(as_tuple=True)[0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8]
-    assert mask[8].nonzero(as_tuple=True)[0].tolist() == [0, 5, 6, 7, 8, 9, 10]
-    assert mask[18].nonzero(as_tuple=True)[0].tolist() == [0, 5, 6, 7, 8, 19, 20]
+    mask = build_dense_teacher_forcing_gen_mask(layout)
+    frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, block_size).tolist()
+    clean_columns = layout.clean_token_indexes
+    noisy_columns = layout.noisy_output_indexes
+    for frame_id in range(num_frames):
+        block_id = frame_block_ids[frame_id]
+        oldest_visible_block = max(0, block_id - history_blocks)
+        expected_clean = [
+            oldest_visible_block <= frame_block_ids[candidate] <= block_id for candidate in range(num_frames)
+        ]
+        expected_clean = [value for value in expected_clean for _ in range(spatial)]
+        expected_prev_clean = [
+            oldest_visible_block <= frame_block_ids[candidate] < block_id for candidate in range(num_frames)
+        ]
+        expected_prev_clean = [value for value in expected_prev_clean for _ in range(spatial)]
+        expected_same_noisy = [frame_block_ids[candidate] == block_id for candidate in range(num_frames)]
+        expected_same_noisy = [value for value in expected_same_noisy for _ in range(spatial)]
+        for token in range(spatial):
+            clean_row = frame_id * spatial + token
+            noisy_row = num_frames * spatial + clean_row
+            assert mask[clean_row, clean_columns].tolist() == expected_clean
+            assert not mask[clean_row, noisy_columns].any()
+            assert mask[noisy_row, clean_columns].tolist() == expected_prev_clean
+            assert mask[noisy_row, noisy_columns].tolist() == expected_same_noisy
 
 
 @pytest.mark.parametrize("block_size", [1, 2, 3, 4])
@@ -287,23 +313,21 @@ def test_dense_mask_matches_lingbot_full_video_boundaries(block_size: int, histo
         block_size=block_size,
         history_blocks=history_blocks,
     )
-    mask = build_dense_teacher_forcing_gen_mask(
-        layout,
-        max_sequence_length=layout.source_sequence_indexes.numel(),
-    )
+    mask = build_dense_teacher_forcing_gen_mask(layout)
 
     clean_columns = layout.clean_token_indexes
     noisy_columns = layout.noisy_output_indexes
+    frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, block_size).tolist()
     for frame_id in range(num_frames):
-        block_id = frame_id // block_size
+        block_id = frame_block_ids[frame_id]
         oldest_visible_block = max(0, block_id - history_blocks)
         expected_clean_for_clean = [
-            oldest_visible_block <= candidate // block_size <= block_id for candidate in range(num_frames)
+            oldest_visible_block <= frame_block_ids[candidate] <= block_id for candidate in range(num_frames)
         ]
         expected_clean_for_noisy = [
-            oldest_visible_block <= candidate // block_size < block_id for candidate in range(num_frames)
+            oldest_visible_block <= frame_block_ids[candidate] < block_id for candidate in range(num_frames)
         ]
-        expected_noisy_for_noisy = [candidate // block_size == block_id for candidate in range(num_frames)]
+        expected_noisy_for_noisy = [frame_block_ids[candidate] == block_id for candidate in range(num_frames)]
 
         clean_row = frame_id
         noisy_row = num_frames + frame_id
@@ -321,28 +345,11 @@ def test_dense_mask_isolates_packed_samples():
         history_blocks=2,
     )
 
-    mask = build_dense_teacher_forcing_gen_mask(
-        layout, max_sequence_length=layout.source_sequence_indexes.numel()
-    )
+    mask = build_dense_teacher_forcing_gen_mask(layout)
     query_sample_ids = layout.sample_ids[layout.gen_query_indexes]
 
     assert not mask[query_sample_ids == 0][:, layout.sample_ids == 1].any()
     assert not mask[query_sample_ids == 1][:, layout.sample_ids == 0].any()
-
-
-def test_dense_mask_rejects_sequences_over_the_configured_limit():
-    layout = build_teacher_forcing_layout(
-        und_token_counts=[1],
-        vision_token_shapes=[(3, 1, 1)],
-        block_size=1,
-        history_blocks=1,
-    )
-    sequence_length = layout.source_sequence_indexes.numel()
-
-    with pytest.raises(ValueError, match="max_sequence_length"):
-        build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=sequence_length - 1)
-    with pytest.raises(ValueError, match="max_sequence_length"):
-        build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=0)
 
 
 def test_dense_mask_rejects_und_queries_in_gen_query_indexes():
@@ -355,7 +362,7 @@ def test_dense_mask_rejects_und_queries_in_gen_query_indexes():
     corrupted = replace(layout, gen_query_indexes=torch.tensor([0], dtype=torch.long))
 
     with pytest.raises(ValueError, match="GEN queries"):
-        build_dense_teacher_forcing_gen_mask(corrupted, max_sequence_length=3)
+        build_dense_teacher_forcing_gen_mask(corrupted)
 
 
 def test_teacher_forcing_api_is_exported():
@@ -367,7 +374,29 @@ def test_teacher_forcing_api_is_exported():
     assert sequence_packing.build_dense_teacher_forcing_gen_mask is build_dense_teacher_forcing_gen_mask
     assert sequence_packing.expand_packed_sequence_for_teacher_forcing is expand_packed_sequence_for_teacher_forcing
     assert sequence_packing.sample_teacher_forcing_parameters is sample_teacher_forcing_parameters
+    assert sequence_packing.sample_teacher_forcing_geometry is sample_teacher_forcing_geometry
+    assert sequence_packing.TeacherForcingGeometry is TeacherForcingGeometry
     assert sequence_packing.select_teacher_forcing_noisy_outputs is select_teacher_forcing_noisy_outputs
+
+
+def test_build_teacher_forcing_frame_block_ids_isolates_the_first_latent():
+    assert build_teacher_forcing_frame_block_ids(1, 4).tolist() == [0]
+    assert build_teacher_forcing_frame_block_ids(5, 2).tolist() == [0, 1, 1, 2, 2]
+    assert build_teacher_forcing_frame_block_ids(4, 1).tolist() == [0, 1, 2, 3]
+
+
+def test_sample_teacher_forcing_geometry_is_independent_per_sample():
+    generator = torch.Generator().manual_seed(7)
+    geometry = sample_teacher_forcing_geometry(
+        num_samples=8,
+        block_size_min=1,
+        block_size_max=4,
+        history_blocks_min=1,
+        history_blocks_max=4,
+        generator=generator,
+    )
+    assert len(geometry.block_sizes) == 8
+    assert len(set(geometry.block_sizes)) > 1 or len(set(geometry.history_blocks)) > 1
 
 
 def _make_packed_video_sequence() -> PackedSequence:
@@ -517,6 +546,21 @@ def test_expand_packed_sequence_rejects_clean_payload_dtype_mismatch():
         )
 
 
+def test_map_action_sigmas_from_vision_schedule_follows_latent_frames():
+    vision_sigmas = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.0]])
+    mapped = map_action_sigmas_from_vision_schedule(
+        vision_sigmas,
+        action_sample_indices=[0, 1],
+        action_lengths=[5, 3],
+        num_vision_latent_frames=[3, 2],
+        temporal_compression_factor=2,
+    )
+    # Sample 0: latent frames [0,1,1,2,2] → σ [0.1, 0.2, 0.2, 0.3, 0.3]
+    # Sample 1: latent frames [0,1,1] → σ [0.4, 0.5, 0.5], padded to T=5
+    torch.testing.assert_close(mapped[0], torch.tensor([0.1, 0.2, 0.2, 0.3, 0.3]))
+    torch.testing.assert_close(mapped[1], torch.tensor([0.4, 0.5, 0.5, 0.0, 0.0]))
+
+
 def test_assign_action_steps_to_latent_frames_uses_offset_zero_ceiling():
     assert assign_action_steps_to_latent_frames(5, 3, 2) == [0, 1, 1, 2, 2]
     # LIBERO-like: 16 action steps, 5 latent frames, cf=4.
@@ -541,19 +585,19 @@ def test_build_teacher_forcing_layout_interleaves_action_per_block():
         temporal_compression_factor=2,
     )
 
-    # Vision frame blocks [0,0,1]; action latent frames [0,1,1,2,2] -> blocks
-    # [0,0,0,1,1]. Interleaved GEN order: [V0 V1 A0 A1 A2 | V2 A3 A4].
+    # Vision frame blocks [0 | 1 1]; action latent frames [0,1,1,2,2] -> blocks
+    # [0,1,1,1,1]. Interleaved GEN order: [V0 A0 | V1 V2 A1 A2 A3 A4].
     assert layout.original_sample_lens == (9,)
     assert layout.sample_lens == (17,)
     assert layout.split_lens == (1, 16)
-    assert layout.source_sequence_indexes.tolist() == [0] + [1, 2, 4, 5, 6, 3, 7, 8] * 2
+    assert layout.source_sequence_indexes.tolist() == [0] + [1, 4, 2, 3, 5, 6, 7, 8] * 2
     assert layout.stream_ids.tolist() == [-1] + [0] * 8 + [1] * 8
-    assert layout.block_ids.tolist() == [-1] + [0, 0, 0, 0, 0, 1, 1, 1] * 2
+    assert layout.block_ids.tolist() == [-1] + [0, 0, 1, 1, 1, 1, 1, 1] * 2
     assert layout.gen_query_indexes.tolist() == list(range(1, 17))
-    assert layout.clean_token_indexes.tolist() == [1, 2, 6]
-    assert layout.clean_action_token_indexes.tolist() == [3, 4, 5, 7, 8]
-    assert layout.noisy_output_indexes.tolist() == [9, 10, 14, 11, 12, 13, 15, 16]
-    assert layout.noisy_action_output_indexes.tolist() == [11, 12, 13, 15, 16]
+    assert layout.clean_token_indexes.tolist() == [1, 3, 4]
+    assert layout.clean_action_token_indexes.tolist() == [2, 5, 6, 7, 8]
+    assert layout.noisy_output_indexes.tolist() == [9, 11, 12, 10, 13, 14, 15, 16]
+    assert layout.noisy_action_output_indexes.tolist() == [10, 13, 14, 15, 16]
 
 
 def test_build_teacher_forcing_layout_without_action_keeps_empty_action_fields():
@@ -588,7 +632,7 @@ def test_dense_mask_applies_block_rules_across_vision_and_action():
         action_token_counts=[5],
         temporal_compression_factor=2,
     )
-    mask = build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=layout.source_sequence_indexes.numel())
+    mask = build_dense_teacher_forcing_gen_mask(layout)
 
     # GEN order per stream: [V0 A0 | V1 A1 A2 | V2 A3 A4] with blocks [0,0,1,1,1,2,2,2].
     # Columns: 0=UND, clean 1..8, noisy 9..16. Rows follow gen_query_indexes (position-1).
@@ -707,31 +751,32 @@ def test_expand_packed_sequence_interleaves_vision_and_action_per_block():
 
     assert expanded.teacher_forcing is not None
     layout = expanded.teacher_forcing.layout
-    # Sample 0 (S=2): vision blocks [0,0,1]; action blocks [0,0,0,1,1].
-    # GEN order: [V0 V1 A0 A1 A2 | V2 A3 A4] -> sources [2,3,5,6,7,4,8,9].
-    # Sample 1: single block -> sources [11,12,13,14,15,16,17].
+    # Sample 0 (S=2): vision blocks [0 | 1 1]; action blocks [0,1,1,1,1].
+    # GEN order: [V0 A0 | V1 V2 A1 A2 A3 A4] -> sources [2,5,3,4,6,7,8,9].
+    # Sample 1 (S=2): vision blocks [0 | 1]; action blocks [0,1,1].
+    # GEN order: [V0a V0b A0 | V1a V1b A1 A2] -> sources [11,12,15,13,14,16,17].
     assert layout.original_sample_lens == (10, 8)
     assert layout.sample_lens == (18, 15)
     assert layout.split_lens == (2, 16, 1, 14)
-    expected_gen_source_0 = [2, 3, 5, 6, 7, 4, 8, 9]
-    expected_gen_source_1 = [11, 12, 13, 14, 15, 16, 17]
+    expected_gen_source_0 = [2, 5, 3, 4, 6, 7, 8, 9]
+    expected_gen_source_1 = [11, 12, 15, 13, 14, 16, 17]
     assert layout.source_sequence_indexes.tolist() == (
         [0, 1] + expected_gen_source_0 * 2 + [10] + expected_gen_source_1 * 2
     )
-    assert layout.clean_token_indexes.tolist() == [2, 3, 7, 19, 20, 21, 22]
-    assert layout.clean_action_token_indexes.tolist() == [4, 5, 6, 8, 9, 23, 24, 25]
+    assert layout.clean_token_indexes.tolist() == [2, 4, 5, 19, 20, 22, 23]
+    assert layout.clean_action_token_indexes.tolist() == [3, 6, 7, 8, 9, 21, 24, 25]
     # Per sample: vision (frame order) then action (step order).
-    assert layout.noisy_output_indexes.tolist() == [10, 11, 15, 12, 13, 14, 16, 17] + [26, 27, 28, 29, 30, 31, 32]
-    assert layout.noisy_action_output_indexes.tolist() == [12, 13, 14, 16, 17, 30, 31, 32]
+    assert layout.noisy_output_indexes.tolist() == [10, 12, 13, 11, 14, 15, 16, 17] + [26, 27, 29, 30, 28, 31, 32]
+    assert layout.noisy_action_output_indexes.tolist() == [11, 14, 15, 16, 17, 28, 31, 32]
 
     assert expanded.text_indexes.tolist() == [0, 1, 18]
-    assert expanded.vision.sequence_indexes.tolist() == [10, 11, 15, 26, 27, 28, 29]
-    assert expanded.vision.mse_loss_indexes.tolist() == [11, 15, 26, 27, 28, 29]
+    assert expanded.vision.sequence_indexes.tolist() == [10, 12, 13, 26, 27, 29, 30]
+    assert expanded.vision.mse_loss_indexes.tolist() == [12, 13, 26, 27, 29, 30]
     assert expanded.action is not None
-    assert expanded.action.sequence_indexes.tolist() == [12, 13, 14, 16, 17, 30, 31, 32]
-    assert expanded.action.mse_loss_indexes.tolist() == [13, 14, 16, 17, 30, 31, 32]
-    assert [span.sequence_start for span in expanded.vision.spans] == [10, 11, 15, 26, 28]
-    assert [span.sequence_start for span in expanded.action.spans] == [12, 13, 14, 16, 17, 30, 31, 32]
+    assert expanded.action.sequence_indexes.tolist() == [11, 14, 15, 16, 17, 28, 31, 32]
+    assert expanded.action.mse_loss_indexes.tolist() == [14, 15, 16, 17, 28, 31, 32]
+    assert [span.sequence_start for span in expanded.vision.spans] == [10, 12, 13, 26, 29]
+    assert [span.sequence_start for span in expanded.action.spans] == [11, 14, 15, 16, 17, 28, 31, 32]
     assert expanded.action.tokens == packed.action.tokens
     assert expanded.action.condition_mask == packed.action.condition_mask
     assert expanded.teacher_forcing.clean_action_tokens == clean_action
@@ -739,7 +784,7 @@ def test_expand_packed_sequence_interleaves_vision_and_action_per_block():
     # Clean/noisy slots of each modality share mRoPE positions.
     assert torch.equal(
         expanded.position_ids[:, layout.clean_token_indexes],
-        expanded.position_ids[:, torch.tensor([10, 11, 15, 26, 27, 28, 29])],
+        expanded.position_ids[:, torch.tensor([10, 12, 13, 26, 27, 29, 30])],
     )
     assert torch.equal(
         expanded.position_ids[:, layout.clean_action_token_indexes],
@@ -747,7 +792,7 @@ def test_expand_packed_sequence_interleaves_vision_and_action_per_block():
     )
 
     # Cross-sample isolation still holds on the interleaved layout.
-    mask = build_dense_teacher_forcing_gen_mask(layout, max_sequence_length=layout.source_sequence_indexes.numel())
+    mask = build_dense_teacher_forcing_gen_mask(layout)
     query_sample_ids = layout.sample_ids[layout.gen_query_indexes]
     assert not mask[query_sample_ids == 0][:, layout.sample_ids == 1].any()
     assert not mask[query_sample_ids == 1][:, layout.sample_ids == 0].any()

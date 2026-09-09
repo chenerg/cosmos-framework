@@ -30,11 +30,39 @@ def _empty_long_tensor() -> torch.LongTensor:
 
 
 @dataclass(frozen=True)
+class TeacherForcingGeometry:
+    """Per-sample block geometry shared by noise sampling and attention."""
+
+    block_sizes: tuple[int, ...]
+    history_blocks: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.block_sizes:
+            raise ValueError("teacher-forcing geometry cannot be empty")
+        if len(self.block_sizes) != len(self.history_blocks):
+            raise ValueError("teacher-forcing geometry must contain one block_size and history_blocks value per sample")
+        if any(block_size < 1 for block_size in self.block_sizes):
+            raise ValueError(f"teacher-forcing block_size values must be >= 1, got {self.block_sizes}")
+        if any(history < 1 for history in self.history_blocks):
+            raise ValueError(f"teacher-forcing history_blocks values must be >= 1, got {self.history_blocks}")
+
+
+def shared_teacher_forcing_geometry(num_samples: int, block_size: int, history_blocks: int) -> TeacherForcingGeometry:
+    """Repeat one S/K pair across every packed sample."""
+
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+    return TeacherForcingGeometry(
+        block_sizes=(block_size,) * num_samples,
+        history_blocks=(history_blocks,) * num_samples,
+    )
+
+
+@dataclass(frozen=True)
 class TeacherForcingLayout:
     """Immutable geometry shared by packing, attention, and output recovery."""
 
-    block_size: int
-    history_blocks: int
+    geometry: TeacherForcingGeometry
     original_sample_lens: tuple[int, ...]
     sample_lens: tuple[int, ...]
     split_lens: tuple[int, ...]
@@ -117,6 +145,89 @@ def sample_teacher_forcing_parameters(
     return block_size, history_blocks
 
 
+def sample_teacher_forcing_geometry(
+    *,
+    num_samples: int,
+    block_size_min: int = 1,
+    block_size_max: int = 4,
+    history_blocks_min: int = 1,
+    history_blocks_max: int = 32,
+    generator: torch.Generator | None = None,
+) -> TeacherForcingGeometry:
+    """Independently sample block geometry for every packed sample."""
+
+    if num_samples < 1:
+        raise ValueError(f"num_samples must be >= 1, got {num_samples}")
+    _validate_inclusive_range("block_size", block_size_min, block_size_max)
+    _validate_inclusive_range("history_blocks", history_blocks_min, history_blocks_max)
+    block_sizes = torch.randint(
+        block_size_min,
+        block_size_max + 1,
+        (num_samples,),
+        generator=generator,
+        device="cpu",
+    )
+    history_blocks = torch.randint(
+        history_blocks_min,
+        history_blocks_max + 1,
+        (num_samples,),
+        generator=generator,
+        device="cpu",
+    )
+    return TeacherForcingGeometry(
+        block_sizes=tuple(int(value) for value in block_sizes.tolist()),
+        history_blocks=tuple(int(value) for value in history_blocks.tolist()),
+    )
+
+
+def build_teacher_forcing_frame_block_ids(num_frames: int, block_size: int) -> torch.LongTensor:
+    """Assign the first latent to a singleton block and chunk the remaining latents."""
+
+    if num_frames < 1:
+        raise ValueError(f"num_frames must be >= 1, got {num_frames}")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+
+    block_ids = torch.zeros(num_frames, dtype=torch.long)
+    if num_frames > 1:
+        block_ids[1:] = 1 + torch.div(
+            torch.arange(num_frames - 1, dtype=torch.long),
+            block_size,
+            rounding_mode="floor",
+        )
+    return block_ids  # type: ignore[return-value]
+
+
+def map_action_sigmas_from_vision_schedule(
+    vision_sigmas: torch.Tensor,
+    *,
+    action_sample_indices: Sequence[int],
+    action_lengths: Sequence[int],
+    num_vision_latent_frames: Sequence[int],
+    temporal_compression_factor: int,
+) -> torch.Tensor:
+    """Expand per-frame vision σ onto each action step via latent-frame alignment.
+
+    Returns a dense tensor of shape ``[n_action, T_action_max]``. Unused tail
+    entries for shorter action sequences are zero.
+    """
+
+    if len(action_sample_indices) != len(action_lengths):
+        raise ValueError(
+            "action_sample_indices and action_lengths must contain one entry per action sample, "
+            f"got {len(action_sample_indices)} and {len(action_lengths)}"
+        )
+    if not action_sample_indices:
+        return vision_sigmas.new_zeros((0, 0))
+    t_action_max = max(action_lengths)
+    mapped = vision_sigmas.new_zeros((len(action_sample_indices), t_action_max))
+    for dense_index, (batch_index, action_len) in enumerate(zip(action_sample_indices, action_lengths, strict=True)):
+        t_vis = num_vision_latent_frames[batch_index]
+        latent_frames = assign_action_steps_to_latent_frames(action_len, t_vis, temporal_compression_factor)
+        mapped[dense_index, :action_len] = vision_sigmas[batch_index, latent_frames]
+    return mapped
+
+
 def assign_action_steps_to_latent_frames(
     num_action_steps: int,
     num_latent_frames: int,
@@ -147,8 +258,9 @@ def build_teacher_forcing_layout(
     *,
     und_token_counts: Sequence[int],
     vision_token_shapes: Sequence[tuple[int, int, int]],
-    block_size: int,
-    history_blocks: int,
+    geometry: TeacherForcingGeometry | None = None,
+    block_size: int | None = None,
+    history_blocks: int | None = None,
     action_token_counts: Sequence[int] | None = None,
     temporal_compression_factor: int | None = None,
 ) -> TeacherForcingLayout:
@@ -159,7 +271,8 @@ def build_teacher_forcing_layout(
     per causal block: ``[UND | clean: V_b0 A_b0 V_b1 A_b1 ... | noisy: ...]``.
     Action steps are assigned to blocks through their physical VAE latent
     frame (``assign_action_steps_to_latent_frames``), assuming
-    ``action_start_frame_offset=0``.
+    ``action_start_frame_offset=0``. Latent frame 0 is a singleton block;
+    remaining frames are chunked with each sample's ``block_size``.
     """
 
     if len(und_token_counts) != len(vision_token_shapes):
@@ -169,10 +282,15 @@ def build_teacher_forcing_layout(
         )
     if not und_token_counts:
         raise ValueError("teacher-forcing layout cannot be built from an empty batch")
-    if block_size < 1:
-        raise ValueError(f"block_size must be >= 1, got {block_size}")
-    if history_blocks < 1:
-        raise ValueError(f"history_blocks must be >= 1, got {history_blocks}")
+    if geometry is None:
+        if block_size is None or history_blocks is None:
+            raise ValueError("build_teacher_forcing_layout requires geometry or both block_size and history_blocks")
+        geometry = shared_teacher_forcing_geometry(len(und_token_counts), block_size, history_blocks)
+    elif len(geometry.block_sizes) != len(und_token_counts):
+        raise ValueError(
+            "teacher-forcing geometry must contain one entry per packed sample, "
+            f"got {len(geometry.block_sizes)} and {len(und_token_counts)}"
+        )
     if action_token_counts is not None:
         if len(action_token_counts) != len(und_token_counts):
             raise ValueError(
@@ -198,7 +316,9 @@ def build_teacher_forcing_layout(
 
     original_offset = 0
     new_offset = 0
-    for sample_id, (und_count, vision_shape) in enumerate(zip(und_token_counts, vision_token_shapes)):
+    for sample_id, (und_count, vision_shape, sample_block_size) in enumerate(
+        zip(und_token_counts, vision_token_shapes, geometry.block_sizes, strict=True)
+    ):
         if und_count < 1:
             raise ValueError(f"und_token_counts[{sample_id}] must be >= 1, got {und_count}")
         if len(vision_shape) != 3:
@@ -223,14 +343,15 @@ def build_teacher_forcing_layout(
         vision_source_start = original_offset + und_count
         action_source_start = vision_source_start + vision_count
 
-        num_blocks = (num_frames + block_size - 1) // block_size
+        vision_frame_block_ids = build_teacher_forcing_frame_block_ids(num_frames, sample_block_size)
+        num_blocks = int(vision_frame_block_ids[-1].item()) + 1
         action_block_of_step: list[int] = []
         if action_count > 0:
             assert temporal_compression_factor is not None
             action_latent_frames = assign_action_steps_to_latent_frames(
                 action_count, num_frames, temporal_compression_factor
             )
-            action_block_of_step = [latent_frame // block_size for latent_frame in action_latent_frames]
+            action_block_of_step = [int(vision_frame_block_ids[latent_frame]) for latent_frame in action_latent_frames]
 
         # Interleave the GEN stream per causal block: vision frames of block b
         # (in frame order) followed by the action steps of block b (in step
@@ -241,8 +362,11 @@ def build_teacher_forcing_layout(
         action_positions_in_gen: list[int] = []  # step order
         next_action_step = 0
         for block_id in range(num_blocks):
-            frame_lo = block_id * block_size
-            frame_hi = min(frame_lo + block_size, num_frames)
+            frame_indexes = [frame_idx for frame_idx, bid in enumerate(vision_frame_block_ids.tolist()) if bid == block_id]
+            if not frame_indexes:
+                continue
+            frame_lo = frame_indexes[0]
+            frame_hi = frame_indexes[-1] + 1
             num_block_vision = (frame_hi - frame_lo) * spatial_tokens
             vision_positions_in_gen.extend(range(len(gen_source), len(gen_source) + num_block_vision))
             gen_source.extend(
@@ -288,8 +412,7 @@ def build_teacher_forcing_layout(
         new_offset = new_sample_end
 
     return TeacherForcingLayout(
-        block_size=block_size,
-        history_blocks=history_blocks,
+        geometry=geometry,
         original_sample_lens=tuple(original_sample_lens),
         sample_lens=tuple(sample_lens),
         split_lens=tuple(split_lens),
@@ -331,7 +454,13 @@ def build_dense_teacher_forcing_gen_mask(
     key_is_clean = key_stream_ids == int(TeacherForcingStream.CLEAN)
     key_is_noisy = key_stream_ids == int(TeacherForcingStream.NOISY)
 
-    inside_history = key_block_ids >= query_block_ids - layout.history_blocks
+    sample_history_blocks = torch.tensor(
+        layout.geometry.history_blocks,
+        dtype=layout.block_ids.dtype,
+        device=layout.block_ids.device,
+    )
+    query_history_blocks = sample_history_blocks[query_sample_ids]
+    inside_history = key_block_ids >= query_block_ids - query_history_blocks
     clean_query_visible = key_is_clean & inside_history & (key_block_ids <= query_block_ids)
     noisy_query_visible = (key_is_clean & inside_history & (key_block_ids < query_block_ids)) | (
         key_is_noisy & (key_block_ids == query_block_ids)
@@ -352,7 +481,7 @@ def build_per_sample_teacher_forcing_gen_masks(
 
     masks: list[torch.BoolTensor] = []
     sample_offset = 0
-    for sample_len in layout.sample_lens:
+    for sample_len, history_blocks in zip(layout.sample_lens, layout.geometry.history_blocks, strict=True):
         sample_slice = slice(sample_offset, sample_offset + sample_len)
         sample_stream_ids = layout.stream_ids[sample_slice]
         sample_block_ids = layout.block_ids[sample_slice]
@@ -367,7 +496,7 @@ def build_per_sample_teacher_forcing_gen_masks(
         key_is_und = key_stream_ids == int(TeacherForcingStream.UND)
         key_is_clean = key_stream_ids == int(TeacherForcingStream.CLEAN)
         key_is_noisy = key_stream_ids == int(TeacherForcingStream.NOISY)
-        inside_history = key_block_ids >= query_block_ids - layout.history_blocks
+        inside_history = key_block_ids >= query_block_ids - history_blocks
         clean_query_visible = key_is_clean & inside_history & (key_block_ids <= query_block_ids)
         noisy_query_visible = (key_is_clean & inside_history & (key_block_ids < query_block_ids)) | (
             key_is_noisy & (key_block_ids == query_block_ids)
@@ -522,7 +651,7 @@ def visualize_dense_teacher_forcing_gen_mask(
     draw.text((8, 25), f"rows/columns: {columns_hint}", fill="black")
     draw.text(
         (8, 44),
-        f"und_block={und_block_size}, vision_block={layout.block_size}, history={layout.history_blocks}",
+        f"und_block={und_block_size}, vision_block={layout.geometry.block_sizes}, history={layout.geometry.history_blocks}",
         fill="black",
     )
     legend_entries = [
@@ -801,8 +930,9 @@ def expand_packed_sequence_for_teacher_forcing(
     packed_sequence: PackedSequence,
     *,
     clean_vision_tokens: Sequence[torch.Tensor],
-    block_size: int,
-    history_blocks: int,
+    geometry: TeacherForcingGeometry | None = None,
+    block_size: int | None = None,
+    history_blocks: int | None = None,
     clean_action_tokens: Sequence[torch.Tensor] | None = None,
     temporal_compression_factor: int | None = None,
 ) -> PackedSequence:
@@ -822,6 +952,10 @@ def expand_packed_sequence_for_teacher_forcing(
     action = packed_sequence.action
 
     _validate_clean_payloads("vision", clean_vision_tokens, vision.tokens)
+    if geometry is None:
+        if block_size is None or history_blocks is None:
+            raise ValueError("teacher-forcing expansion requires geometry or both block_size and history_blocks")
+        geometry = shared_teacher_forcing_geometry(len(clean_vision_tokens), block_size, history_blocks)
     if action is not None:
         if clean_action_tokens is None:
             raise ValueError("clean_action_tokens is required when the packed sequence contains action data")
@@ -832,8 +966,7 @@ def expand_packed_sequence_for_teacher_forcing(
     layout = build_teacher_forcing_layout(
         und_token_counts=und_token_counts,
         vision_token_shapes=vision_token_shapes,
-        block_size=block_size,
-        history_blocks=history_blocks,
+        geometry=geometry,
         action_token_counts=action_token_counts,
         temporal_compression_factor=temporal_compression_factor,
     )

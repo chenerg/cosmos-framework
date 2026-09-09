@@ -181,7 +181,10 @@ class OmniMoTModelConfig:
     # Attention implementation for joint understanding + generation
     # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.
     # "three_way" must only be used when introducing sparsity
-    joint_attn_implementation: str = "two_way"  # "two_way" or "three_way"
+    joint_attn_implementation: str = attrs.field(
+        default="two_way",
+        validator=attrs.validators.in_({"two_way", "three_way", "teacher_forcing"}),
+    )
 
     # Per-layer NATTEN parameters
     # Must use "three_way" attention if used.
@@ -229,7 +232,7 @@ class OmniMoTModelConfig:
     # Requires joint_attn_implementation="three_way".
     video_temporal_causal: bool = False
     # "none":             standard joint denoising (shared σ, no clean context)
-    # "teacher_forcing":  all frames noised with shared σ; clean history via cross-attention
+    # "teacher_forcing":  per-causal-block σ; clean history via cross-attention
     # "diffusion_forcing": each latent frame gets independent σ ~ Uniform[0,1]
     # "teacher_forcing_dcm": replayed teacher-forcing discrete-time consistency distillation
     causal_training_strategy: str = attrs.field(
@@ -237,8 +240,9 @@ class OmniMoTModelConfig:
         validator=attrs.validators.in_({"none", "teacher_forcing", "diffusion_forcing", "teacher_forcing_dcm"}),
     )
     # Scheme-B teacher-forcing block geometry. One base chunk is one VAE latent
-    # temporal frame and all of its spatial tokens. Ranges are inclusive and one
-    # S/K pair is sampled for the entire forward.
+    # temporal frame and all of its spatial tokens. Ranges are inclusive. Each
+    # packed sample independently draws one S/K pair; latent frame 0 is always
+    # a singleton block and remaining frames are chunked by S.
     teacher_forcing_block_size_min: int = 1
     teacher_forcing_block_size_max: int = 4
     teacher_forcing_history_blocks_min: int = 1

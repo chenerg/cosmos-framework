@@ -40,6 +40,7 @@ from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.configuration_qwen3_
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.moe import (
     create_text_experts,
 )
+from cosmos_framework.model.generator.utils.fused_rms_norm import npu_fused_rms_norm
 
 # Small additive constant to prevent log(0) in router entropy computation.
 ENTROPY_EPSILON = 1e-9
@@ -271,6 +272,9 @@ class Qwen3VLMoeTextRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        fused = npu_fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if fused is not None:
+            return fused
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

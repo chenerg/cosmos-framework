@@ -20,6 +20,7 @@ from transformers.modeling_utils import PreTrainedModel
 from cosmos_framework.model.generator.reasoner.nemotron_3_dense_vl.configuration_nemotron_3_dense_vl import (
     Nemotron3DenseVLTextConfig,
 )
+from cosmos_framework.model.generator.utils.fused_rms_norm import npu_fused_rms_norm
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -53,6 +54,9 @@ class Nemotron3DenseVLRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        fused = npu_fused_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        if fused is not None:
+            return fused
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

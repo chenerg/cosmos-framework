@@ -37,6 +37,7 @@ from cosmos_framework.model.generator.mot.attention import SplitInfo, dispatch_a
 from cosmos_framework.model.generator.mot.context_parallel_utils import context_parallel_attention
 from cosmos_framework.model.generator.utils.memory import KVToStore, MemoryValue
 from cosmos_framework.utils import log
+from cosmos_framework.utils.device_backend import IS_NPU
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 
 
@@ -301,6 +302,16 @@ def apply_compile(model: nn.Module, config: CompileConfig) -> None:
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
+    # NPU inductor needs Triton (absent here). TorchAir ``backend="npu"`` traces
+    # the eager RMSNorm/relu2 graph without fusing it, so compile is equal or
+    # slower than eager. Pointwise speed comes from ``npu_fused_rms_norm``.
+    if IS_NPU:
+        log.warning(
+            "Skipping MoT torch.compile on NPU (no Triton; TorchAir does not "
+            "speed up Nemotron RMSNorm/relu2). Using fused npu_rms_norm instead."
+        )
+        return
+
     compile_options = {}
     if config.max_autotune_pointwise:
         compile_options["max_autotune_pointwise"] = True

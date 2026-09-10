@@ -369,7 +369,7 @@ def build_teacher_forcing_layout(
             action_latent_frames = assign_action_steps_to_latent_frames(
                 action_count, num_frames, temporal_compression_factor
             )
-            action_block_of_step = [int(vision_frame_block_ids[latent_frame]) for latent_frame in action_latent_frames]
+            action_block_of_step = vision_frame_block_ids[torch.tensor(action_latent_frames, dtype=torch.long)].tolist()
 
         # Interleave the GEN stream per causal block: vision frames of block b
         # (in frame order) followed by the action steps of block b (in step
@@ -380,10 +380,9 @@ def build_teacher_forcing_layout(
         action_positions_in_gen: list[int] = []  # step order
         sample_block_spans: list[tuple[int, int] | None] = [None] * num_blocks
         next_action_step = 0
+        vision_frame_block_ids_list = vision_frame_block_ids.tolist()
         for block_id in range(num_blocks):
-            frame_indexes = [
-                frame_idx for frame_idx, bid in enumerate(vision_frame_block_ids.tolist()) if bid == block_id
-            ]
+            frame_indexes = [frame_idx for frame_idx, bid in enumerate(vision_frame_block_ids_list) if bid == block_id]
             if not frame_indexes:
                 continue
             block_gen_start = len(gen_source)
@@ -976,11 +975,11 @@ def _validate_teacher_forcing_packed_sequence(
 
         sample_offset += sample_len
 
-    if packed_sequence.text_indexes.tolist() != expected_text_indexes:
+    if not _sequence_indexes_match(packed_sequence.text_indexes, expected_text_indexes):
         raise ValueError("text and GEN sequence indexes must form the expected per-sample UND/GEN partition")
-    if vision.sequence_indexes.tolist() != expected_vision_indexes:
+    if not _sequence_indexes_match(vision.sequence_indexes, expected_vision_indexes):
         raise ValueError("text and GEN sequence indexes must form the expected per-sample UND/GEN partition")
-    if action is not None and action.sequence_indexes.tolist() != expected_action_indexes:
+    if action is not None and not _sequence_indexes_match(action.sequence_indexes, expected_action_indexes):
         raise ValueError("action sequence indexes must directly follow each sample's vision tokens")
     if packed_sequence.split_lens != expected_split_lens or packed_sequence.attn_modes != expected_attn_modes:
         raise ValueError(
@@ -995,24 +994,53 @@ def _validate_teacher_forcing_packed_sequence(
     return und_token_counts, vision_token_shapes, action_token_counts
 
 
+def _sequence_indexes_match(actual: torch.Tensor, expected: list[int]) -> bool:
+    """Compare packed index tensors without ``.tolist()`` on the hot path."""
+
+    if actual.numel() != len(expected):
+        return False
+    expected_t = torch.tensor(expected, dtype=actual.dtype)
+    return bool(torch.equal(actual.detach().cpu(), expected_t))
+
+
 def _build_source_to_stream_index(
     layout: TeacherForcingLayout,
     stream: TeacherForcingStream,
-) -> dict[int, int]:
+) -> torch.Tensor:
+    """Map original packed indexes to expanded indexes of one stream.
+
+    Returns a 1-D long table ``t`` where ``t[source]`` is the expanded index, or
+    ``-1`` when ``source`` is not in ``stream``. Built with a single scatter so
+    expansion does not call ``.item()`` once per token.
+    """
+
+    source = layout.source_sequence_indexes
+    if source.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    table = source.new_full((int(source.max().item()) + 1,), -1)
     stream_indexes = torch.nonzero(layout.stream_ids == int(stream), as_tuple=True)[0]
-    return {int(layout.source_sequence_indexes[new_index]): int(new_index) for new_index in stream_indexes}
+    if stream_indexes.numel() == 0:
+        return table
+    table[source.index_select(0, stream_indexes)] = stream_indexes
+    return table
 
 
-def _remap_indexes(indexes: torch.Tensor | None, source_to_new: dict[int, int], name: str) -> torch.Tensor | None:
+def _remap_indexes(indexes: torch.Tensor | None, source_to_new: torch.Tensor, name: str) -> torch.Tensor | None:
     if indexes is None:
         return None
-    try:
-        remapped = [source_to_new[int(index)] for index in indexes]
-    except KeyError as error:
-        raise ValueError(
-            f"{name} contains an index outside the supported source stream: {int(error.args[0])}"
-        ) from error
-    return torch.tensor(remapped, dtype=torch.long)
+    if indexes.numel() == 0:
+        return torch.empty(0, dtype=torch.long)
+    cpu_indexes = indexes.detach().to(device=source_to_new.device, dtype=torch.long)
+    in_range = (cpu_indexes >= 0) & (cpu_indexes < source_to_new.numel())
+    if not bool(in_range.all()):
+        bad = int(cpu_indexes[~in_range][0].item())
+        raise ValueError(f"{name} contains an index outside the supported source stream: {bad}")
+    remapped = source_to_new.index_select(0, cpu_indexes)
+    missing = remapped < 0
+    if bool(missing.any()):
+        bad = int(cpu_indexes[missing][0].item())
+        raise ValueError(f"{name} contains an index outside the supported source stream: {bad}")
+    return remapped
 
 
 def _validate_clean_payloads(
@@ -1045,17 +1073,19 @@ def _validate_clean_payloads(
             )
 
 
-def _remap_spans(spans, source_to_noisy: dict[int, int], name: str) -> list:
+def _remap_spans(spans, source_to_noisy: torch.Tensor, name: str) -> list:
     """Shift modality spans into the noisy stream, requiring per-span contiguity."""
 
     remapped_spans = []
     for span in spans:
-        span_indexes = [
-            source_to_noisy[index] for index in range(span.sequence_start, span.sequence_start + span.sequence_len)
-        ]
-        if span_indexes != list(range(span_indexes[0], span_indexes[0] + span.sequence_len)):
+        span_indexes = source_to_noisy[span.sequence_start : span.sequence_start + span.sequence_len]
+        if span_indexes.numel() != span.sequence_len or bool((span_indexes < 0).any()):
+            raise ValueError(f"{name} contains an index outside the supported source stream: {span.sequence_start}")
+        start = int(span_indexes[0].item())
+        expected = torch.arange(start, start + span.sequence_len, dtype=span_indexes.dtype, device=span_indexes.device)
+        if not torch.equal(span_indexes, expected):
             raise ValueError(f"{name} span at source index {span.sequence_start} is not contiguous after remapping")
-        remapped_spans.append(replace(span, sequence_start=span_indexes[0]))
+        remapped_spans.append(replace(span, sequence_start=start))
     return remapped_spans
 
 

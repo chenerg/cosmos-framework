@@ -16,6 +16,26 @@ def _empty_float_tensor() -> torch.Tensor:
     return torch.empty(0, dtype=torch.float32)  # [0]
 
 
+def as_frame_timesteps(input_timestep: float | torch.Tensor, num_frames: int) -> list[float]:
+    """Return one Python float per frame without a per-index `.item()` loop.
+
+    Teacher-forcing and diffusion-forcing pass a CPU ``Tensor(T,)``. Indexing
+    that tensor in Python and calling ``.item()`` per frame is tens of
+    microseconds of ATen dispatch each; on device it is also an implicit stream
+    sync. Convert the whole vector once, then index the resulting Python list.
+    """
+    if num_frames < 1:
+        return []
+    if isinstance(input_timestep, torch.Tensor):
+        values = input_timestep.reshape(-1).detach().to(device="cpu", dtype=torch.float32)
+        if values.numel() == 1:
+            return [float(values.item())] * num_frames
+        if values.numel() < num_frames:
+            raise ValueError(f"per-frame timestep tensor has {values.numel()} entries, need at least {num_frames}")
+        return values[:num_frames].tolist()
+    return [float(input_timestep)] * num_frames
+
+
 @dataclass
 class ModalitySpan:
     """One contiguous packed span paired with its logical modality payload slice.

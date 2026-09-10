@@ -7,6 +7,7 @@ import math
 
 import torch
 
+from cosmos_framework.data.generator.sequence_packing.modality import as_frame_timesteps
 from cosmos_framework.data.generator.sequence_packing.mrope import get_3d_mrope_ids_vae_tokens
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
 
@@ -249,6 +250,7 @@ def pack_supertokens_temporal_causal(
             action_ids_3d = null_ids.reshape(3, 1, tcf)  # [3,1,tcf]
 
     seq_builder._mrope_temporal_offset = new_offset
+    frame_timesteps = as_frame_timesteps(input_timestep, latent_t)
 
     for frame_t in range(latent_t):
         if pack_action_tokens:
@@ -280,7 +282,6 @@ def pack_supertokens_temporal_causal(
         # Vision MSE loss: supervise non-conditioning frames
         if frame_t not in condition_set_vision:
             vision.mse_loss_indexes.extend(frame_indexes)
-            frame_ts = input_timestep[frame_t].item() if isinstance(input_timestep, torch.Tensor) else input_timestep
-            vision.timesteps.extend([frame_ts] * patches_per_frame)
+            vision.timesteps.extend([frame_timesteps[frame_t]] * patches_per_frame)
 
     return total_split_len, null_action_flag

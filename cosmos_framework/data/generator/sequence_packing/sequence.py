@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from cosmos_framework.data.generator.sequence_packing.modality import ModalityData, ModalityDataBuilder, ModalitySpan
+from cosmos_framework.data.generator.sequence_packing.modality import (
+    ModalityData,
+    ModalityDataBuilder,
+    ModalitySpan,
+    as_frame_timesteps,
+)
 from cosmos_framework.data.generator.sequence_packing.mrope import (
     get_3d_mrope_ids_text_tokens,
     get_3d_mrope_ids_vae_tokens,
@@ -315,6 +320,7 @@ class PackedSequenceBuilder:
             actual_temporal_compression_factor=temporal_compression_factor,
         )  # vision_mrope_ids: [3,N_vision_tokens]
         vision_mrope_ids = vision_mrope_ids.reshape(3, latent_t, frame_token_stride)  # [3,T,H*W]
+        frame_timesteps = as_frame_timesteps(input_timestep, latent_t)
 
         vision_split_len = 0
         for frame_idx in range(latent_t):
@@ -331,11 +337,7 @@ class PackedSequenceBuilder:
             if frame_idx in condition_set:
                 continue
             vision.mse_loss_indexes.extend(frame_indexes)
-            if isinstance(input_timestep, torch.Tensor):
-                frame_ts = input_timestep[frame_idx].item()
-            else:
-                frame_ts = input_timestep
-            vision.timesteps.extend([frame_ts] * frame_token_stride)
+            vision.timesteps.extend([frame_timesteps[frame_idx]] * frame_token_stride)
 
         return vision_split_len
 
@@ -415,6 +417,7 @@ class PackedSequenceBuilder:
         )  # action_mrope_ids: [3,N_action_tokens]
         # Note: we don't update _mrope_temporal_offset here because action tokens
         # share the temporal space with vision tokens (they run in parallel).
+        frame_timesteps = as_frame_timesteps(input_timestep, action_split_len)
 
         for frame_idx in range(action_split_len):
             position_ids = action_mrope_ids[:, frame_idx : frame_idx + 1]  # [3,1]
@@ -429,12 +432,7 @@ class PackedSequenceBuilder:
             if frame_idx in condition_set:
                 continue
             action.mse_loss_indexes.extend(frame_indexes)
-            if isinstance(input_timestep, torch.Tensor):
-                timestep_values = input_timestep.reshape(-1)
-                frame_ts = timestep_values[frame_idx].item() if timestep_values.numel() > 1 else timestep_values.item()
-            else:
-                frame_ts = input_timestep
-            action.timesteps.extend([frame_ts])
+            action.timesteps.extend([frame_timesteps[frame_idx]])
 
         return action_split_len
 

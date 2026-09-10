@@ -6,13 +6,15 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 import torch
 
-from cosmos_framework.data.generator.sequence_packing.modality import ModalityData, ModalitySpan
+from cosmos_framework.data.generator.sequence_packing.modality import ModalityData, ModalitySpan, as_frame_timesteps
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequence
 from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     TeacherForcingData,
     TeacherForcingGeometry,
     TeacherForcingLayout,
     TeacherForcingStream,
+    _build_source_to_stream_index,
+    _remap_indexes,
     assign_action_steps_to_latent_frames,
     build_dense_teacher_forcing_gen_mask,
     build_teacher_forcing_block_attention_groups,
@@ -908,3 +910,45 @@ def test_block_attention_groups_hide_current_clean_from_noisy_queries():
         assert noisy_group.query_start == gen_len + gen_start
         assert current_clean.isdisjoint(visible)
         assert current_noisy <= visible
+
+
+def test_as_frame_timesteps_converts_vector_once():
+    scalar = as_frame_timesteps(0.25, 4)
+    assert scalar == [0.25, 0.25, 0.25, 0.25]
+    per_frame = as_frame_timesteps(torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5]), 4)
+    assert per_frame == pytest.approx([0.1, 0.2, 0.3, 0.4])
+    broadcast = as_frame_timesteps(torch.tensor([0.7]), 3)
+    assert broadcast == pytest.approx([0.7, 0.7, 0.7])
+    assert as_frame_timesteps(1.0, 0) == []
+
+
+def test_as_frame_timesteps_rejects_short_vector():
+    with pytest.raises(ValueError, match="per-frame timestep"):
+        as_frame_timesteps(torch.tensor([0.1, 0.2]), 3)
+
+
+def test_remap_indexes_matches_python_dict_on_interleaved_layout():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[4, 3],
+        vision_token_shapes=[(6, 2, 2), (5, 2, 2)],
+        block_size=2,
+        history_blocks=2,
+        action_token_counts=[8, 6],
+        temporal_compression_factor=2,
+    )
+    source_indexes = torch.arange(layout.original_sample_lens[0] + layout.original_sample_lens[1], dtype=torch.long)
+    for stream in (TeacherForcingStream.UND, TeacherForcingStream.NOISY):
+        table = _build_source_to_stream_index(layout, stream)
+        stream_indexes = torch.nonzero(layout.stream_ids == int(stream), as_tuple=True)[0]
+        expected = {
+            int(layout.source_sequence_indexes[new_index]): int(new_index) for new_index in stream_indexes.tolist()
+        }
+        present = torch.tensor(sorted(expected), dtype=torch.long)
+        remapped = _remap_indexes(present, table, f"{stream.name}.sequence_indexes")
+        assert remapped is not None
+        assert remapped.tolist() == [expected[int(index)] for index in present.tolist()]
+        missing = source_indexes[torch.isin(source_indexes, present, invert=True)]
+        if missing.numel() == 0:
+            continue
+        with pytest.raises(ValueError, match="outside the supported source stream"):
+            _remap_indexes(missing[:1], table, f"{stream.name}.sequence_indexes")

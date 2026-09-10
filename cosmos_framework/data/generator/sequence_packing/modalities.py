@@ -7,6 +7,7 @@ import math
 
 import torch
 
+from cosmos_framework.data.generator.sequence_packing.modality import as_frame_timesteps
 from cosmos_framework.data.generator.sequence_packing.mrope import (
     get_3d_mrope_ids_text_tokens,
     get_3d_mrope_ids_vae_tokens,
@@ -303,17 +304,14 @@ def pack_vision_tokens(
     packed_seq.vision.noisy_frame_indexes.append(vision_noisy_frame_indexes)
 
     frame_token_stride = patch_h * patch_w
+    frame_timesteps = as_frame_timesteps(input_timestep, latent_t)
     for frame_idx in range(latent_t):
         if frame_idx in condition_set:
             continue
         frame_start = curr + frame_idx * frame_token_stride
         frame_end = frame_start + frame_token_stride
         packed_seq.vision.mse_loss_indexes.extend(range(frame_start, frame_end))
-        if isinstance(input_timestep, torch.Tensor):
-            frame_ts = input_timestep[frame_idx].item()
-        else:
-            frame_ts = input_timestep
-        packed_seq.vision.timesteps.extend([frame_ts] * frame_token_stride)
+        packed_seq.vision.timesteps.extend([frame_timesteps[frame_idx]] * frame_token_stride)
 
     curr += num_vision_tokens
     vision_split_len += num_vision_tokens

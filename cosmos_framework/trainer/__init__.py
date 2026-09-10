@@ -13,7 +13,11 @@ import torch.utils.data
 
 from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.context_managers import distributed_init
-from cosmos_framework.utils.profiling import maybe_enable_memory_snapshot, maybe_enable_nsys_profiling, maybe_enable_profiling
+from cosmos_framework.utils.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_nsys_profiling,
+    maybe_enable_profiling,
+)
 
 try:
     from megatron.core import parallel_state
@@ -28,7 +32,6 @@ from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, ema, log, misc
 from cosmos_framework.utils.checkpointer import Checkpointer
 from cosmos_framework.utils.misc import StragglerDetectorV2
-
 
 
 class ImaginaireTrainer:
@@ -208,6 +211,15 @@ class ImaginaireTrainer:
         # Leaving this for backward compability for now, but we can think about moving this to model.on_train_start for all models.
         model = model.to("cuda", memory_format=self.config.trainer.memory_format)  # type: ignore
         model.on_train_start(self.config.trainer.memory_format)
+
+        if getattr(dataloader_train, "encode_vision_latents", False):
+            attach = getattr(dataloader_train, "attach_vision_tokenizer", None)
+            if not callable(attach):
+                raise RuntimeError(
+                    "dataloader_train.encode_vision_latents is True, but the dataloader "
+                    "has no attach_vision_tokenizer (expected PackingDataLoader)."
+                )
+            attach(getattr(model, "tokenizer_vision_gen", None))
 
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()

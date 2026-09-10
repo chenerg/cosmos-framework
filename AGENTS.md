@@ -92,6 +92,7 @@ For a per-subpackage tour with descriptions, see [`docs/code_structure.md`](./do
 | [docs/training.md](./docs/training.md)             | Single- and multi-node launches, parallelism, mixed precision.    |
 | [docs/inference.md](./docs/inference.md)           | Sample arguments, parallelism, schemas, troubleshooting.          |
 | [docs/faq.md](./docs/faq.md)                       | Troubleshooting (OOM, NCCL, slow training) + env vars.            |
+| [experiments/](./experiments/README.md)            | One directory per local training probe (time / loss / HBM / RSS). |
 
 Agent skills (codebase navigation, env troubleshooting, inference, post-training, setup) live in [`.agents/skills/`](./.agents/skills) and [`.claude/skills/`](./.claude/skills).
 

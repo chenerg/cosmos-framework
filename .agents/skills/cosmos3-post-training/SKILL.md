@@ -127,6 +127,16 @@ DROID concat 480p (`K=391` vis tokens / latent, packing `extra=500`): `max_pre_t
 
 Whole-episode host-RAM extras (recipe Python / Hydra tail, not TOML schema): `dataloader_train.lookahead_limit` (Edge recipe `1`; default `10` caches extra decoded videos) and `dataloader_train.dataloader.prefetch_factor` (`2` in the Edge recipe; `1` if RSS is tight). `num_workers=4` is the 8-card 480p floor that stops data-wait; `ActionIterableShuffleDataset` wraps when `ranks × workers >` episode count.
 
+Optional VAE pre-encode on `PackingDataLoader` (Hydra tail; default off). After packing, the rank process encodes uint8 video with the model's frozen `tokenizer_vision_gen` and yields `video_latents` so `get_data_and_condition` skips encode. Trainer calls `attach_vision_tokenizer` after `model.on_train_start`.
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `dataloader_train.encode_vision_latents` | `false` | Encode packed videos before yield; drop pixels unless `keep_video_pixels` |
+| `dataloader_train.encoded_prefetch_depth` | `0` | `0` = encode in `next()`. `>=1` pre-fills that many encoded batches on a producer thread so training can overlap the next encode |
+| `dataloader_train.keep_video_pixels` | `false` | Keep uint8 `video` after encode (viz only) |
+
+Do **not** construct a second VAE. On 64 GiB 910B3, `encoded_prefetch_depth=1` can OOM if next-batch pixels overlap backward; fall back to `0`. Sync encode moves `timer/encoding` into `timer/dataloader_train` and does not hide wall time. Probe: `run_bench_20step_tf_vae_pack.py`.
+
 ### Causal teacher forcing
 
 Scheme-B causal training needs **both**:
@@ -160,7 +170,9 @@ EXTRA_TAIL_OVERRIDES="dataloader_train.max_sequence_length=48000 dataloader_trai
 EXTRA_TAIL_OVERRIDES="dataloader_train.dataloader.datasets.droid.dataset.max_pre_tf_tokens=48000"
 ```
 
-Local weights: `DROID_ROOT=/data5T/Embodied-AI/datasets/droid_plus_lerobot_640x360_20260412`, Edge DCP + processor and Wan VAE under `/data5T/Embodied-AI/ckpts/` (see `AGENTS.md`).
+Local weights: `DROID_ROOT=/data5T/Embodied-AI/datasets/droid_plus_lerobot_640x360_20260412`（symlink → `Cosmos3-DROID`；`info.json` **500** episodes / 146133 frames；`split_val_ratio=0.03` `split_seed=42` → train 485，whole-episode 丢掉 &lt;33 帧后 **484**。不要再用 9 月初扫测的 193）。Edge DCP + processor and Wan VAE under `/data5T/Embodied-AI/ckpts/` (see `AGENTS.md`).
+
+8-card / teacher-forcing probes: one directory per run under [`experiments/`](../../../experiments/README.md). Do not leave metrics only in `bench_max_episode_blocks/` or a loose `docs/*.md`.
 
 ## Related skills
 

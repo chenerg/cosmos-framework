@@ -78,6 +78,26 @@ from cosmos_framework.utils.device_backend import DEVICE_TYPE
 from cosmos_framework.utils.flags import DEVICE, TRAINING, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
+
+
+def _pixel_t_h_w(
+    raw_state: torch.Tensor | None,
+    pixel_shape: tuple[int, int, int] | None,
+) -> tuple[int, int, int]:
+    """Pixel (T, H, W) from a vision tensor or a packed-batch shape triple."""
+    if raw_state is not None:
+        if raw_state.dim() == 5:
+            return int(raw_state.shape[2]), int(raw_state.shape[3]), int(raw_state.shape[4])
+        if raw_state.dim() == 4:
+            return int(raw_state.shape[1]), int(raw_state.shape[2]), int(raw_state.shape[3])
+        raise ValueError(
+            f"raw_state_vision items must have shape [B,C,T,H,W] or [C,T,H,W], got shape {tuple(raw_state.shape)}."
+        )
+    if pixel_shape is None:
+        raise ValueError("raw_state_vision or pixel_shape is required to compute vision temporal positions")
+    return int(pixel_shape[0]), int(pixel_shape[1]), int(pixel_shape[2])
+
+
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.lazy_config import LazyDict
@@ -539,8 +559,7 @@ class OmniMoTModel(ImaginaireModel):
     def _derive_include_end_of_generation_token(self) -> bool:
         impl = self.config.joint_attn_implementation
         assert impl in ("two_way", "three_way", "teacher_forcing"), (
-            f"Invalid joint_attn_implementation: {impl}. "
-            "Must be 'two_way', 'three_way', or 'teacher_forcing'."
+            f"Invalid joint_attn_implementation: {impl}. Must be 'two_way', 'three_way', or 'teacher_forcing'."
         )
         return False
 
@@ -630,10 +649,11 @@ class OmniMoTModel(ImaginaireModel):
 
     def _get_temporal_positions_vision(
         self,
-        raw_state_vision: list[torch.Tensor],
+        raw_state_vision: list[torch.Tensor] | None,
         x0_tokens_vision: list[torch.Tensor],
         num_views_per_vision_item: list[int] | None = None,
         frames_per_vision_item: list[int] | None = None,
+        pixel_shapes: list[tuple[int, int, int]] | None = None,
     ) -> list[torch.Tensor] | None:
         """Return optional per-latent temporal coordinates for vision tokens.
 
@@ -642,6 +662,9 @@ class OmniMoTModel(ImaginaireModel):
         view/time axes, and flatten them in the same order as the latents. A
         future timestamp-major layout only needs to transpose those two axes
         before flattening.
+
+        When ``raw_state_vision`` is None (pre-encoded latents from the
+        dataloader), ``pixel_shapes`` supplies the (T, H, W) of each item.
         """
         mode = self.config.diffusion_expert_config.vision_temporal_position_mode
         if mode == "latent_index":
@@ -653,43 +676,45 @@ class OmniMoTModel(ImaginaireModel):
             )
 
         assert self.tokenizer_vision_gen is not None
+        n_items = len(x0_tokens_vision)
         if (num_views_per_vision_item is None) != (frames_per_vision_item is None):
             raise ValueError("num_views_per_vision_item and frames_per_vision_item must be provided together.")
         if num_views_per_vision_item is None:
-            num_views_per_vision_item = [1] * len(raw_state_vision)
-            frames_per_vision_item_optional: list[int | None] = [None] * len(raw_state_vision)
+            num_views_per_vision_item = [1] * n_items
+            frames_per_vision_item_optional: list[int | None] = [None] * n_items
         else:
             assert frames_per_vision_item is not None
-            if len(num_views_per_vision_item) != len(raw_state_vision) or len(frames_per_vision_item) != len(
-                raw_state_vision
-            ):
+            if len(num_views_per_vision_item) != n_items or len(frames_per_vision_item) != n_items:
                 raise ValueError(
                     "Multiview temporal-position metadata must align with flattened vision items: "
                     f"got {len(num_views_per_vision_item)} view counts, {len(frames_per_vision_item)} frame "
-                    f"counts, and {len(raw_state_vision)} vision items."
+                    f"counts, and {n_items} vision items."
                 )
             frames_per_vision_item_optional = list(frames_per_vision_item)
 
+        if raw_state_vision is not None and len(raw_state_vision) != n_items:
+            raise ValueError(
+                "raw_state_vision and x0_tokens_vision must have the same length: "
+                f"got {len(raw_state_vision)} pixel items and {n_items} latents."
+            )
+        if pixel_shapes is not None and len(pixel_shapes) != n_items:
+            raise ValueError(
+                f"pixel_shapes must align with x0_tokens_vision: got {len(pixel_shapes)} shapes and {n_items} latents."
+            )
+
         temporal_positions_vision: list[torch.Tensor] = []
-        for raw_state_vision_i, x0_tokens_vision_i, num_views, frames_per_view in zip(
-            raw_state_vision,
-            x0_tokens_vision,
-            num_views_per_vision_item,
-            frames_per_vision_item_optional,
-            strict=True,
+        for idx, (x0_tokens_vision_i, num_views, frames_per_view) in enumerate(
+            zip(
+                x0_tokens_vision,
+                num_views_per_vision_item,
+                frames_per_vision_item_optional,
+                strict=True,
+            )
         ):
-            if raw_state_vision_i.dim() == 5:
-                num_pixel_frames = int(raw_state_vision_i.shape[2])
-            elif raw_state_vision_i.dim() == 4:
-                num_pixel_frames = int(raw_state_vision_i.shape[1])
-            else:
-                raise ValueError(
-                    "raw_state_vision items must have shape [B,C,T,H,W] or [C,T,H,W], "
-                    f"got shape {tuple(raw_state_vision_i.shape)}."
-                )
+            raw_state_vision_i = None if raw_state_vision is None else raw_state_vision[idx]
+            shape = None if pixel_shapes is None else pixel_shapes[idx]
+            num_pixel_frames, frame_h, frame_w = _pixel_t_h_w(raw_state_vision_i, shape)
             num_latent_frames = int(x0_tokens_vision_i.shape[2])
-            frame_h = int(raw_state_vision_i.shape[-2])
-            frame_w = int(raw_state_vision_i.shape[-1])
             resolution = get_vision_data_resolution((frame_h, frame_w))
 
             if num_views > 1:
@@ -1085,9 +1110,7 @@ class OmniMoTModel(ImaginaireModel):
             iteration=iteration,
         )
         self._replace_clean_with_noised(packed_sequence, gen_data_noised)
-        packed_sequence = self.post_noise_packing_hook(
-            packed_sequence, gen_data_clean, teacher_forcing_geometry
-        )
+        packed_sequence = self.post_noise_packing_hook(packed_sequence, gen_data_clean, teacher_forcing_geometry)
 
         # Move packed sequence to CUDA
         packed_sequence.to_cuda()
@@ -1337,7 +1360,10 @@ class OmniMoTModel(ImaginaireModel):
 
     def _update_train_stats(self, data_batch: dict[str, torch.Tensor]) -> None:
         is_image = self.is_image_batch(data_batch)
-        input_key = self.input_image_key if is_image else self.input_video_key
+        if is_image:
+            input_key = self.input_image_key if self.input_image_key in data_batch else "image_latents"
+        else:
+            input_key = self.input_video_key if self.input_video_key in data_batch else "video_latents"
         if isinstance(self.net, WeightTrainingStat):
             val = data_batch[input_key]
             # For image editing data_batch[input_key] is a list-of-lists, not a tensor.
@@ -1468,9 +1494,9 @@ class OmniMoTModel(ImaginaireModel):
                     for sample_id, block_count in enumerate(block_counts)
                 ]
             )
-            block_sigmas = rectified_flow.sample_train_time(
-                total_blocks, iteration=iteration, shifts=block_shifts
-            ).to(**self.tensor_kwargs_fp32)
+            block_sigmas = rectified_flow.sample_train_time(total_blocks, iteration=iteration, shifts=block_shifts).to(
+                **self.tensor_kwargs_fp32
+            )
             sigmas = torch.zeros((batch_size, T_max), **self.tensor_kwargs_fp32)
             block_offset = 0
             for sample_id, (num_frames, block_size, block_count) in enumerate(
@@ -3305,6 +3331,18 @@ class OmniMoTModel(ImaginaireModel):
             frames_per_vision_item.extend([sample_frames_per_view[sample_idx]] * num_vision_items)
         return num_views_per_vision_item, frames_per_vision_item
 
+    @staticmethod
+    def _coerce_precomputed_vision_latents(latents: list[Any]) -> list[torch.Tensor]:
+        """Flatten packed ``video_latents`` / ``image_latents`` to 5-D tensors."""
+        out: list[torch.Tensor] = []
+        for item in latents:
+            clips = item if isinstance(item, (list, tuple)) else [item]
+            for clip in clips:
+                if not isinstance(clip, torch.Tensor):
+                    raise TypeError(f"Precomputed vision latent must be a tensor, got {type(clip)}")
+                out.append(clip if clip.ndim == 5 else clip.unsqueeze(0))
+        return out
+
     def _encode_vision_item(
         self,
         state: torch.Tensor,
@@ -3528,7 +3566,10 @@ class OmniMoTModel(ImaginaireModel):
         # Detect whether any sample has multiple vision items (e.g. image editing).
         # If so, track the count per sample before all vision items from this batch are flattened into a list.
         is_image_batch = self.is_image_batch(data_batch)
-        sample_vision_list = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
+        precomputed_latents = bool(data_batch.get("vae_latents_ready"))
+        latent_key = "image_latents" if is_image_batch else "video_latents"
+        media_key = self.input_image_key if is_image_batch else self.input_video_key
+        sample_vision_list = data_batch[latent_key if precomputed_latents else media_key]
 
         # we should always get this information here during training. If we can read this field
         # from data_batch it means we are in the visualization callback:
@@ -3549,9 +3590,13 @@ class OmniMoTModel(ImaginaireModel):
 
             # if has_multiple_vision_per_sample, this means that the input media is a list of lists of tensors, we need to flatten it to a list of tensors
             if has_multiple_vision_per_sample:
-                media_key = self.input_video_key if not is_image_batch else self.input_image_key
-                data_batch[media_key] = [item.unsqueeze(0) for sublist in sample_vision_list for item in sublist]
-                if data_batch[media_key][0].dtype == torch.float32 and not is_image_batch:
+                flatten_key = latent_key if precomputed_latents else media_key
+                data_batch[flatten_key] = [
+                    item if (isinstance(item, torch.Tensor) and item.ndim == 5) else item.unsqueeze(0)
+                    for sublist in sample_vision_list
+                    for item in sublist
+                ]
+                if not precomputed_latents and data_batch[flatten_key][0].dtype == torch.float32 and not is_image_batch:
                     data_batch["is_preprocessed"] = (
                         True  # for video batch, is_processed = True means the video data is normalized. However, for the image batch, is_processed = True means the image data is augmented with a temporal dimension.
                     )
@@ -3573,21 +3618,27 @@ class OmniMoTModel(ImaginaireModel):
                 timer.start()
 
         # Vision (image/video) raw state and tokenized latent state
-        self._normalize_video_databatch_inplace(data_batch)
-        self._augment_image_dim_inplace(data_batch)  # converts each image tensor to (1, C, 1, H, W)
-        raw_state_vision = data_batch[self.input_image_key if is_image_batch else self.input_video_key]
+        pixel_shapes: list[tuple[int, int, int]] | None = None
         num_views_per_vision_item, frames_per_vision_item = self._get_multiview_vae_metadata(
             data_batch,
             num_vision_items_per_sample,
             batch_size,
         )
-        x0_tokens_vision = self._encode_vision_x0_tokens(
-            raw_state_vision,
-            num_vision_items_per_sample,
-            vision_condition_indexes,
-            num_views_per_vision_item,
-            frames_per_vision_item,
-        )
+        if precomputed_latents:
+            x0_tokens_vision = self._coerce_precomputed_vision_latents(data_batch[latent_key])
+            raw_state_vision = None
+            pixel_shapes = data_batch.get("image_pixel_shapes" if is_image_batch else "video_pixel_shapes")
+        else:
+            self._normalize_video_databatch_inplace(data_batch)
+            self._augment_image_dim_inplace(data_batch)  # converts each image tensor to (1, C, 1, H, W)
+            raw_state_vision = data_batch[media_key]
+            x0_tokens_vision = self._encode_vision_x0_tokens(
+                raw_state_vision,
+                num_vision_items_per_sample,
+                vision_condition_indexes,
+                num_views_per_vision_item,
+                frames_per_vision_item,
+            )
 
         frame_size = data_batch.get("image_size", None)
         if frame_size is not None:
@@ -3598,6 +3649,7 @@ class OmniMoTModel(ImaginaireModel):
             x0_tokens_vision=x0_tokens_vision,
             num_views_per_vision_item=num_views_per_vision_item,
             frames_per_vision_item=frames_per_vision_item,
+            pixel_shapes=pixel_shapes,
         )
 
         # Action – extract dense action / domain_id without mutating data_batch,
@@ -3642,8 +3694,13 @@ class OmniMoTModel(ImaginaireModel):
 
         if TRAINING and log_enc_time and timer is not None:
             timer.end()
-            elapsed = timer.get_cuda_time()
-            h, w = raw_state_vision[0].shape[-2], raw_state_vision[0].shape[-1]
+            elapsed = 0.0 if precomputed_latents else timer.get_cuda_time()
+            if raw_state_vision is not None:
+                h, w = raw_state_vision[0].shape[-2], raw_state_vision[0].shape[-1]
+            elif pixel_shapes:
+                h, w = pixel_shapes[0][1], pixel_shapes[0][2]
+            else:
+                h, w = 0, 0
             resolution_label = "unknown"
             for res_name, aspect_ratios in VIDEO_RES_SIZE_INFO.items():
                 if (h, w) in aspect_ratios.values():
@@ -4059,9 +4116,12 @@ class OmniMoTModel(ImaginaireModel):
         We handle two types of data_batch: one from a joint_dataloader where "dataset_name" can
         differentiate image_batch and video_batch, another from a single dataloader which we
         assume as video_data by default.
+
+        Pre-encoded PackingDataLoader batches may drop uint8 pixels and only keep
+        ``image_latents`` / ``video_latents``.
         """
-        is_image = self.input_image_key in data_batch
-        is_video = self.input_video_key in data_batch
+        is_image = self.input_image_key in data_batch or "image_latents" in data_batch
+        is_video = self.input_video_key in data_batch or "video_latents" in data_batch
         assert is_image != is_video, (
             "Only one of the input_image_key or input_video_key should be present in the data_batch."
         )

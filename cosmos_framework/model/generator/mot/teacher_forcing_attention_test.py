@@ -22,6 +22,7 @@ from cosmos_framework.data.generator.sequence_packing.runtime import (
 from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     build_dense_teacher_forcing_gen_mask,
     build_per_sample_teacher_forcing_gen_masks,
+    build_teacher_forcing_block_attention_groups,
     build_teacher_forcing_layout,
     visualize_dense_teacher_forcing_gen_mask,
 )
@@ -34,6 +35,7 @@ from cosmos_framework.model.generator.mot.attention import (
     resolve_runtime_joint_attn_implementation,
 )
 from cosmos_framework.model.generator.mot.teacher_forcing_attention import (
+    teacher_forcing_block_gather_attention,
     teacher_forcing_dense_attention,
     teacher_forcing_per_sample_dense_attention,
 )
@@ -196,10 +198,8 @@ def test_build_packed_sequence_constructs_teacher_forcing_attention_info_without
 
     assert isinstance(attention_meta, TeacherForcingAttentionInfo)
     assert attention_meta.layout is layout
-    torch.testing.assert_close(
-        attention_meta.dense_gen_mask,
-        build_dense_teacher_forcing_gen_mask(layout),
-    )
+    assert attention_meta.dense_gen_mask is None
+    assert attention_meta.block_groups == build_teacher_forcing_block_attention_groups(layout)
     assert natten_metadata is None
 
 
@@ -215,9 +215,7 @@ def test_per_sample_masks_match_global_mask_diagonal_blocks():
 
     query_offset = 0
     key_offset = 0
-    for sample_mask, sample_len, gen_len in zip(
-        sample_masks, layout.sample_lens, layout.split_lens[1::2], strict=True
-    ):
+    for sample_mask, sample_len, gen_len in zip(sample_masks, layout.sample_lens, layout.split_lens[1::2], strict=True):
         torch.testing.assert_close(
             sample_mask,
             global_mask[
@@ -271,7 +269,8 @@ def test_build_packed_sequence_constructs_per_sample_masks_without_global_mask()
     assert isinstance(attention_meta, TeacherForcingAttentionInfo)
     assert attention_meta.dense_mode == "per_sample"
     assert attention_meta.dense_gen_mask is None
-    assert len(attention_meta.sample_gen_masks) == len(layout.sample_lens)
+    assert attention_meta.sample_gen_masks == ()
+    assert attention_meta.block_groups == build_teacher_forcing_block_attention_groups(layout)
     assert natten_metadata is None
 
 
@@ -346,16 +345,14 @@ def test_dispatch_teacher_forcing_attention_matches_unified_dense_gen_attention(
         get_all_seq(query_pack)[layout.gen_query_indexes],
         get_all_seq(key_pack),
         get_all_seq(value_pack),
-        attention_meta.dense_gen_mask,
+        build_dense_teacher_forcing_gen_mask(layout),
     ).flatten(-2, -1)
     torch.testing.assert_close(get_gen_seq(output_pack)[: expected_gen.shape[0]], expected_gen)
     assert kv_to_store is None
 
 
 def test_dispatch_per_sample_teacher_forcing_attention_matches_unified_dense_gen_attention():
-    layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs(
-        "per_sample"
-    )
+    layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs("per_sample")
 
     output_pack, kv_to_store = dispatch_attention(query_pack, key_pack, value_pack, attention_meta)
     expected_gen = teacher_forcing_dense_attention(
@@ -388,7 +385,7 @@ def test_dispatch_teacher_forcing_attention_uses_normalized_und_keys_for_gen():
         get_all_seq(query_pack)[layout.gen_query_indexes],
         normalized_all_keys,
         get_all_seq(value_pack),
-        attention_meta.dense_gen_mask,
+        build_dense_teacher_forcing_gen_mask(layout),
     ).flatten(-2, -1)
     torch.testing.assert_close(get_gen_seq(output_pack)[: expected_gen.shape[0]], expected_gen)
 
@@ -419,7 +416,10 @@ def test_build_packed_sequence_rejects_teacher_forcing_layout_geometry_mismatch(
 
 
 def test_resolve_runtime_joint_attn_implementation_falls_back_without_layout():
-    assert resolve_runtime_joint_attn_implementation("teacher_forcing", has_teacher_forcing_layout=True) == "teacher_forcing"
+    assert (
+        resolve_runtime_joint_attn_implementation("teacher_forcing", has_teacher_forcing_layout=True)
+        == "teacher_forcing"
+    )
     assert resolve_runtime_joint_attn_implementation("teacher_forcing", has_teacher_forcing_layout=False) == "two_way"
     assert resolve_runtime_joint_attn_implementation("two_way", has_teacher_forcing_layout=False) == "two_way"
 
@@ -447,3 +447,97 @@ def test_build_packed_sequence_rejects_layout_under_two_way():
             num_layers=1,
             teacher_forcing_layout=layout,
         )
+
+
+def _block_gather_inputs(layout, dtype=torch.float64, seed=101):
+    generator = torch.Generator().manual_seed(seed)
+    query = torch.randn(layout.gen_query_indexes.numel(), 4, 3, dtype=dtype, generator=generator)
+    key = torch.randn(sum(layout.sample_lens), 2, 3, dtype=dtype, generator=generator)
+    value = torch.randn(sum(layout.sample_lens), 2, 3, dtype=dtype, generator=generator)
+    return query, key, value
+
+
+@pytest.mark.parametrize(
+    "layout_kwargs",
+    [
+        dict(
+            und_token_counts=[1, 2],
+            vision_token_shapes=[(3, 1, 1), (2, 1, 2)],
+            block_size=2,
+            history_blocks=1,
+        ),
+        dict(
+            und_token_counts=[2],
+            vision_token_shapes=[(7, 1, 1)],
+            block_size=3,
+            history_blocks=32,
+        ),
+        dict(
+            und_token_counts=[1],
+            vision_token_shapes=[(5, 1, 2)],
+            block_size=2,
+            history_blocks=1,
+            action_token_counts=[7],
+            temporal_compression_factor=2,
+        ),
+    ],
+)
+def test_block_gather_attention_matches_dense_mask_outputs_and_gradients(layout_kwargs):
+    layout = build_teacher_forcing_layout(**layout_kwargs)
+    query, key, value = _block_gather_inputs(layout)
+    dense_inputs = [tensor.detach().clone().requires_grad_() for tensor in (query, key, value)]
+    gather_inputs = [tensor.detach().clone().requires_grad_() for tensor in (query, key, value)]
+    dense_mask = build_dense_teacher_forcing_gen_mask(layout)
+    groups = build_teacher_forcing_block_attention_groups(layout)
+
+    dense_output = teacher_forcing_dense_attention(*dense_inputs, dense_mask)
+    gather_output = teacher_forcing_block_gather_attention(*gather_inputs, groups)
+    weight = torch.linspace(0.1, 1.0, dense_output.numel(), dtype=dense_output.dtype).reshape_as(dense_output)
+    (dense_output * weight).sum().backward()
+    (gather_output * weight).sum().backward()
+
+    torch.testing.assert_close(gather_output, dense_output, atol=1e-12, rtol=1e-12)
+    for gather_input, dense_input in zip(gather_inputs, dense_inputs, strict=True):
+        torch.testing.assert_close(gather_input.grad, dense_input.grad, atol=1e-11, rtol=1e-11)
+
+
+def test_block_gather_attention_ignores_keys_outside_visible_slices():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(3, 1, 1)],
+        block_size=1,
+        history_blocks=1,
+    )
+    query, key, value = _block_gather_inputs(layout, dtype=torch.float32, seed=202)
+    groups = build_teacher_forcing_block_attention_groups(layout)
+    baseline = teacher_forcing_block_gather_attention(query, key, value, groups)
+
+    invisible = torch.ones(key.shape[0], dtype=torch.bool)
+    for group in groups:
+        for start, end in group.kv_slices:
+            invisible[start:end] = False
+    modified_value = value.clone()
+    modified_value[invisible] += 100_000
+
+    unchanged = teacher_forcing_block_gather_attention(query, key, modified_value, groups)
+    torch.testing.assert_close(unchanged, baseline)
+
+
+def test_block_gather_attention_rejects_overlapping_query_groups():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(2, 1, 1)],
+        block_size=1,
+        history_blocks=1,
+    )
+    query, key, value = _block_gather_inputs(layout, dtype=torch.float32)
+    groups = list(build_teacher_forcing_block_attention_groups(layout))
+    first = groups[0]
+    groups[0] = type(first)(
+        query_start=first.query_start,
+        query_end=first.query_end + 1,
+        kv_slices=first.kv_slices,
+    )
+
+    with pytest.raises(ValueError, match="cover every GEN query"):
+        teacher_forcing_block_gather_attention(query, key, value, tuple(groups))

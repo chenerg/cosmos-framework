@@ -14,11 +14,12 @@ from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     TeacherForcingLayout,
     TeacherForcingStream,
     assign_action_steps_to_latent_frames,
-    map_action_sigmas_from_vision_schedule,
     build_dense_teacher_forcing_gen_mask,
+    build_teacher_forcing_block_attention_groups,
     build_teacher_forcing_frame_block_ids,
     build_teacher_forcing_layout,
     expand_packed_sequence_for_teacher_forcing,
+    map_action_sigmas_from_vision_schedule,
     sample_teacher_forcing_geometry,
     sample_teacher_forcing_parameters,
     select_teacher_forcing_noisy_outputs,
@@ -103,6 +104,8 @@ def test_build_teacher_forcing_layout_maps_both_streams_to_the_original_tokens()
     assert layout.gen_query_indexes.tolist() == list(range(2, 12))
     assert layout.clean_token_indexes.tolist() == list(range(2, 7))
     assert layout.noisy_output_indexes.tolist() == list(range(7, 12))
+    # Frame 0 is a singleton; remaining frames chunk as (1,2) then (3,4).
+    assert layout.block_token_spans == (((0, 1), (1, 3), (3, 5)),)
 
 
 def test_build_teacher_forcing_layout_expands_spatial_tokens_and_isolates_sample_offsets():
@@ -851,3 +854,57 @@ def test_expand_packed_sequence_rejects_action_steps_beyond_video():
             clean_action_tokens=[torch.zeros_like(token) for token in packed.action.tokens],
             temporal_compression_factor=1,  # A=5 steps then map to latent frames 0..4 > T-1=2
         )
+
+
+def _visible_key_indexes(group) -> list[int]:
+    keys: list[int] = []
+    for start, end in group.kv_slices:
+        keys.extend(range(start, end))
+    return keys
+
+
+def test_block_attention_groups_match_dense_mask_visible_keys():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1, 2],
+        vision_token_shapes=[(5, 1, 2), (3, 2, 1)],
+        block_size=2,
+        history_blocks=1,
+        action_token_counts=[7, 4],
+        temporal_compression_factor=2,
+    )
+    mask = build_dense_teacher_forcing_gen_mask(layout)
+    groups = build_teacher_forcing_block_attention_groups(layout)
+
+    covered = [False] * mask.shape[0]
+    for group in groups:
+        visible = _visible_key_indexes(group)
+        for query_row in range(group.query_start, group.query_end):
+            expected = torch.nonzero(mask[query_row], as_tuple=True)[0].tolist()
+            assert visible == expected
+            assert not covered[query_row]
+            covered[query_row] = True
+    assert all(covered)
+
+
+def test_block_attention_groups_hide_current_clean_from_noisy_queries():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[2],
+        vision_token_shapes=[(5, 1, 1)],
+        block_size=2,
+        history_blocks=2,
+    )
+    groups = build_teacher_forcing_block_attention_groups(layout)
+    gen_len = layout.split_lens[1] // 2
+    und_count = layout.split_lens[0]
+    clean_start = und_count
+    noisy_start = clean_start + gen_len
+    num_blocks = len(layout.block_token_spans[0])
+
+    for block_id, (gen_start, gen_end) in enumerate(layout.block_token_spans[0]):
+        noisy_group = groups[num_blocks + block_id]
+        visible = set(_visible_key_indexes(noisy_group))
+        current_clean = set(range(clean_start + gen_start, clean_start + gen_end))
+        current_noisy = set(range(noisy_start + gen_start, noisy_start + gen_end))
+        assert noisy_group.query_start == gen_len + gen_start
+        assert current_clean.isdisjoint(visible)
+        assert current_noisy <= visible

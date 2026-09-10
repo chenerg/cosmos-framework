@@ -364,8 +364,8 @@ class ModelConfig(BaseModel):
     teacher_forcing_dense_mode: Literal["global", "per_sample"] = Field(
         default="global",
         description=(
-            "Scheme-B GEN attention execution: one global explicit mask, or one dense attention "
-            "call per packed sample to skip cross-sample QK regions."
+            "Retained for recipe compatibility. Scheme-B GEN attention gathers per-block KV "
+            "slices and runs unmasked SDPA; 'global' and 'per_sample' no longer select a dense-mask kernel."
         ),
     )
     teacher_forcing_visualize_sdpa_mask: bool = Field(

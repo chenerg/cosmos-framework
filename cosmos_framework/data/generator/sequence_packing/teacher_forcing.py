@@ -59,6 +59,20 @@ def shared_teacher_forcing_geometry(num_samples: int, block_size: int, history_b
 
 
 @dataclass(frozen=True)
+class TeacherForcingBlockAttentionGroup:
+    """One GEN query block and the packed KV slices visible to it.
+
+    ``query_start``/``query_end`` index the concatenated GEN (full-mode) tokens.
+    ``kv_slices`` index the packed dual-stream sequence and are concatenated in
+    packed order so the gathered keys match the dense-mask visible set.
+    """
+
+    query_start: int
+    query_end: int
+    kv_slices: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
 class TeacherForcingLayout:
     """Immutable geometry shared by packing, attention, and output recovery."""
 
@@ -79,6 +93,9 @@ class TeacherForcingLayout:
     # network can scatter each modality's clean payload independently.
     clean_action_token_indexes: torch.LongTensor = field(default_factory=_empty_long_tensor)
     noisy_action_output_indexes: torch.LongTensor = field(default_factory=_empty_long_tensor)
+    # Per-sample GEN-local ``(start, end)`` spans, indexed by causal block id.
+    # Clean and noisy streams share these offsets inside each sample.
+    block_token_spans: tuple[tuple[tuple[int, int], ...], ...] = ()
 
     def to(self, device: torch.device | str) -> TeacherForcingLayout:
         """Return a copy with all tensor metadata moved to ``device``."""
@@ -313,6 +330,7 @@ def build_teacher_forcing_layout(
     clean_action_token_indexes: list[int] = []
     noisy_output_indexes: list[int] = []
     noisy_action_output_indexes: list[int] = []
+    block_token_spans: list[tuple[tuple[int, int], ...]] = []
 
     original_offset = 0
     new_offset = 0
@@ -360,11 +378,15 @@ def build_teacher_forcing_layout(
         gen_block_ids: list[int] = []
         vision_positions_in_gen: list[int] = []  # frame-major token order
         action_positions_in_gen: list[int] = []  # step order
+        sample_block_spans: list[tuple[int, int] | None] = [None] * num_blocks
         next_action_step = 0
         for block_id in range(num_blocks):
-            frame_indexes = [frame_idx for frame_idx, bid in enumerate(vision_frame_block_ids.tolist()) if bid == block_id]
+            frame_indexes = [
+                frame_idx for frame_idx, bid in enumerate(vision_frame_block_ids.tolist()) if bid == block_id
+            ]
             if not frame_indexes:
                 continue
+            block_gen_start = len(gen_source)
             frame_lo = frame_indexes[0]
             frame_hi = frame_indexes[-1] + 1
             num_block_vision = (frame_hi - frame_lo) * spatial_tokens
@@ -378,10 +400,14 @@ def build_teacher_forcing_layout(
                 gen_source.append(action_source_start + next_action_step)
                 gen_block_ids.append(block_id)
                 next_action_step += 1
+            sample_block_spans[block_id] = (block_gen_start, len(gen_source))
         if next_action_step != action_count:
             raise ValueError(
                 f"sample {sample_id}: {action_count - next_action_step} action steps were not assigned to any block"
             )
+        if any(span is None or span[0] >= span[1] for span in sample_block_spans):
+            raise ValueError(f"sample {sample_id}: every causal block must contain at least one GEN token")
+        filled_block_spans = tuple(span for span in sample_block_spans if span is not None)
 
         clean_start = new_offset + und_count
         noisy_start = clean_start + gen_len
@@ -407,6 +433,7 @@ def build_teacher_forcing_layout(
         noisy_output_indexes.extend(noisy_start + position for position in vision_positions_in_gen)
         noisy_output_indexes.extend(noisy_start + position for position in action_positions_in_gen)
         noisy_action_output_indexes.extend(noisy_start + position for position in action_positions_in_gen)
+        block_token_spans.append(filled_block_spans)
 
         original_offset += original_sample_len
         new_offset = new_sample_end
@@ -426,6 +453,7 @@ def build_teacher_forcing_layout(
         noisy_output_indexes=torch.tensor(noisy_output_indexes, dtype=torch.long),
         clean_action_token_indexes=torch.tensor(clean_action_token_indexes, dtype=torch.long),
         noisy_action_output_indexes=torch.tensor(noisy_action_output_indexes, dtype=torch.long),
+        block_token_spans=tuple(block_token_spans),
     )
 
 
@@ -513,6 +541,111 @@ def build_per_sample_teacher_forcing_gen_masks(
     if sample_offset != layout.source_sequence_indexes.numel():
         raise ValueError("teacher-forcing sample lengths do not cover the complete packed sequence")
     return tuple(masks)
+
+
+def build_teacher_forcing_block_attention_groups(
+    layout: TeacherForcingLayout,
+) -> tuple[TeacherForcingBlockAttentionGroup, ...]:
+    """Build per-block GEN query groups with 2-3 contiguous visible KV slices.
+
+    CLEAN block ``i`` sees UND plus CLEAN blocks ``[lo, i]``.
+    NOISY block ``i`` sees UND, CLEAN blocks ``[lo, i)``, and NOISY block ``i``.
+    ``lo = max(0, i - history_blocks)``. Noisy never sees the current clean block.
+    """
+
+    if len(layout.block_token_spans) != len(layout.sample_lens):
+        raise ValueError(
+            "teacher-forcing layout must contain one block-span list per packed sample, "
+            f"got {len(layout.block_token_spans)} and {len(layout.sample_lens)}"
+        )
+
+    groups: list[TeacherForcingBlockAttentionGroup] = []
+    packed_offset = 0
+    gen_query_offset = 0
+    for sample_id, (sample_len, und_count, history_blocks, spans) in enumerate(
+        zip(
+            layout.sample_lens,
+            layout.split_lens[::2],
+            layout.geometry.history_blocks,
+            layout.block_token_spans,
+            strict=True,
+        )
+    ):
+        gen_split = layout.split_lens[2 * sample_id + 1]
+        if gen_split % 2 != 0:
+            raise ValueError(f"sample {sample_id}: GEN split length must be even (clean+noisy), got {gen_split}")
+        gen_len = gen_split // 2
+        if spans and spans[-1][1] != gen_len:
+            raise ValueError(f"sample {sample_id}: block spans cover {spans[-1][1]} GEN tokens, expected {gen_len}")
+
+        und_start = packed_offset
+        und_end = packed_offset + und_count
+        clean_start = und_end
+        noisy_start = clean_start + gen_len
+        und_slice = (und_start, und_end)
+        # Emit all CLEAN groups then all NOISY groups so the concatenated GEN
+        # query order is a contiguous partition of ``full_q``.
+        sample_clean_groups: list[TeacherForcingBlockAttentionGroup] = []
+        sample_noisy_groups: list[TeacherForcingBlockAttentionGroup] = []
+
+        for block_id, (gen_start, gen_end) in enumerate(spans):
+            if gen_start >= gen_end:
+                raise ValueError(f"sample {sample_id} block {block_id} has an empty GEN span")
+            lo = max(0, block_id - history_blocks)
+            history_start = spans[lo][0]
+            sample_clean_groups.append(
+                TeacherForcingBlockAttentionGroup(
+                    query_start=gen_query_offset + gen_start,
+                    query_end=gen_query_offset + gen_end,
+                    kv_slices=(und_slice, (clean_start + history_start, clean_start + gen_end)),
+                )
+            )
+            noisy_kv: list[tuple[int, int]] = [und_slice]
+            if history_start < gen_start:
+                noisy_kv.append((clean_start + history_start, clean_start + gen_start))
+            noisy_kv.append((noisy_start + gen_start, noisy_start + gen_end))
+            sample_noisy_groups.append(
+                TeacherForcingBlockAttentionGroup(
+                    query_start=gen_query_offset + gen_len + gen_start,
+                    query_end=gen_query_offset + gen_len + gen_end,
+                    kv_slices=tuple(noisy_kv),
+                )
+            )
+        groups.extend(sample_clean_groups)
+        groups.extend(sample_noisy_groups)
+
+        packed_offset += sample_len
+        gen_query_offset += gen_split
+
+    if packed_offset != layout.source_sequence_indexes.numel():
+        raise ValueError("teacher-forcing sample lengths do not cover the complete packed sequence")
+    return tuple(groups)
+
+
+def build_teacher_forcing_packed_kv_metadata(
+    groups: tuple[TeacherForcingBlockAttentionGroup, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build TND gather index and cumulative lengths for packed unmasked attention.
+
+    Query segments follow ``query_start`` order, so packed queries are a view of
+    the GEN tensor. Key/value tokens are gathered with ``kv_gather_index``.
+    """
+
+    kv_index: list[int] = []
+    cu_q = [0]
+    cu_kv = [0]
+    for group in groups:
+        cu_q.append(cu_q[-1] + (group.query_end - group.query_start))
+        for start, end in group.kv_slices:
+            kv_index.extend(range(start, end))
+        cu_kv.append(len(kv_index))
+    if cu_q[-1] == 0:
+        raise ValueError("teacher-forcing packed KV metadata requires at least one GEN query")
+    return (
+        torch.tensor(kv_index, dtype=torch.long),
+        torch.tensor(cu_q, dtype=torch.int32),
+        torch.tensor(cu_kv, dtype=torch.int32),
+    )
 
 
 def visualize_dense_teacher_forcing_gen_mask(

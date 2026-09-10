@@ -247,8 +247,9 @@ class OmniMoTModelConfig:
     teacher_forcing_block_size_max: int = 4
     teacher_forcing_history_blocks_min: int = 1
     teacher_forcing_history_blocks_max: int = 32
-    # "global" builds one packed Dense Mask; "per_sample" loops over packed
-    # samples and builds one smaller Dense Mask for each sample.
+    # Retained for recipe compatibility. GEN attention now gathers 2-3 contiguous
+    # KV slices per causal block and runs unmasked SDPA; this field no longer
+    # selects a dense-mask kernel.
     teacher_forcing_dense_mode: str = "global"
     # Rank 0 saves one compact block-level visualization of the complete
     # attention pattern: causal UND plus the bool mask used by GEN SDPA.

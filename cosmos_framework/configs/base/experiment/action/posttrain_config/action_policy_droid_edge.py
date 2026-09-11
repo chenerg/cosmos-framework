@@ -13,6 +13,17 @@ and the video-style loss scales (``loss_scale=10.0``, ``image_loss_scale=None``)
 so only the action-recipe deltas are applied here. ``DROID_ROOT`` is the
 versioned parent (e.g. ``.../droid_plus_lerobot_640x360_20260412``);
 ``use_success_only=True`` keeps the success split.
+
+The same causal teacher-forcing loop can train V+A, video-only, or both:
+
+- V+A (default): ``datasets.droid.dataset.mode=policy``.
+- Video-only on DROID videos: ``datasets.droid.dataset.mode=image2video``
+  (action tokens are dropped after decode; keep ``action_gen=True`` so
+  ranks without action still have a dummy action graph).
+- Mix DROID V+A with an external video JSONL: set
+  ``datasets.video.ratio>0`` and ``VIDEO_DATASET_PATH``. RankPartitioned
+  assigns whole ranks to one dataset, so each packed batch stays
+  homogeneous. Needs ``world_size >= 2``. Keep ``action_gen=True``.
 """
 
 import copy
@@ -25,6 +36,7 @@ from cosmos_framework.data.generator.joint_dataloader import (
     PackingDataLoader,
     RankPartitionedDataLoader,
 )
+from cosmos_framework.data.generator.local_datasets.sft_dataset import get_sft_dataset
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
 
@@ -199,13 +211,21 @@ action_policy_droid_edge = LazyDict(
             sound_latent_fps=0,
             tokenizer_spatial_compression_factor=16,
             tokenizer_temporal_compression_factor=4,
+            # Encode packed uint8 video in PackingDataLoader (same frozen
+            # tokenizer_vision_gen). Training consumes video_latents.
+            # prefetch_depth=1 overlaps the next encode with the current step.
+            # OOM on 64 GiB: encoded_prefetch_depth=0. Off:
+            # encode_vision_latents=false.
+            encode_vision_latents=True,
+            encoded_prefetch_depth=1,
+            keep_video_pixels=False,
             dataloader=L(RankPartitionedDataLoader)(
                 batch_size=1,
                 in_order=False,
                 num_workers=4,
                 persistent_workers=True,
                 pin_memory=True,
-                prefetch_factor=1,  # 1 queued decoded episode per worker; 2 held ~1 TiB host RSS
+                prefetch_factor=2,  # 256p RSS is OK; 480p used to be huge (~TiB host RSS)
                 sampler=None,
                 # Shuffling is handled by the dataset (iterable_shuffle=True below):
                 # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-
@@ -232,6 +252,8 @@ action_policy_droid_edge = LazyDict(
                             # Policy-only task mode. "joint" would randomly pick
                             # forward_dynamics/inverse_dynamics/policy per sample (multi-task),
                             # which dilutes each per-task loss by ~1/3.
+                            # "image2video" keeps DROID videos but drops action
+                            # tokens (video-only teacher forcing).
                             mode="policy",
                             use_state=True,
                             iterable_shuffle=True,  # rank x worker episode-shuffle stream
@@ -257,6 +279,39 @@ action_policy_droid_edge = LazyDict(
                             tokenizer_config="${model.config.vlm_config.tokenizer}",
                             format_prompt_as_json=True,
                             use_success_only=True,
+                        ),
+                    ),
+                    # Video-only JSONL stream. ratio=0 keeps current DROID-only
+                    # launches. Enable mixed V+A / V-only with:
+                    #   VIDEO_DATASET_PATH=.../BridgeData2-... \
+                    #   EXTRA_TAIL_OVERRIDES="dataloader_train.dataloader.datasets.video.ratio=1"
+                    # RankPartitionedDataLoader requires world_size >= number of
+                    # positive-ratio datasets, so mixed training needs >= 2 ranks.
+                    video=dict(
+                        ratio=0,
+                        dataset=L(get_sft_dataset)(
+                            append_duration_fps_timestamps=True,
+                            append_resolution_info=True,
+                            max_caption_tokens=2048,
+                            caption_suffix="",
+                            cfg_dropout_keep_metadata=False,
+                            cfg_dropout_rate=0.1,
+                            # T2V-only for causal teacher forcing (no I2V/V2V mix).
+                            conditioning_config={0: 1.0, 1: 0.0, 2: 0.0},
+                            conditioning_fps=-1,
+                            conditioning_fps_noise_std=0.0,
+                            frame_selection_mode="first",
+                            jsonl_paths=[
+                                "${oc.env:VIDEO_DATASET_PATH,/__video_dataset_unset__}/train/video_dataset_file.jsonl"
+                            ],
+                            min_short_edge=0,
+                            num_video_frames=-1,
+                            resolution="256",
+                            sample_by_window=False,
+                            temporal_compression_factor=4,
+                            temporal_interval_mode="max_30fps",
+                            use_system_prompt=False,
+                            tokenizer_config="${model.config.vlm_config.tokenizer}",
                         ),
                     ),
                 ),

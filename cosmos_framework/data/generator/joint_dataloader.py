@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import contextlib
 import math
 import queue
 import threading
@@ -69,6 +70,37 @@ def _set_current_torch_device(device: torch.device) -> None:
         torch.cuda.set_device(device)
 
 
+def _maybe_encode_side_stream(device: torch.device):
+    """VAE-encode stream so encode kernels do not occupy the default HCCL stream.
+
+    Returns ``(stream, stream_context)``. CPU and missing stream APIs return
+    ``(None, None)`` so tests and CPU dataloaders keep working.
+    """
+    if device.type == "cpu":
+        return None, None
+    if device.type == "npu" and hasattr(torch, "npu"):
+        npu = torch.npu
+        if (
+            callable(getattr(npu, "is_available", None))
+            and npu.is_available()
+            and hasattr(npu, "Stream")
+            and hasattr(npu, "stream")
+        ):
+            return npu.Stream(device=device), npu.stream
+        return None, None
+    if device.type == "cuda" and torch.cuda.is_available() and hasattr(torch.cuda, "Stream"):
+        return torch.cuda.Stream(device=device), torch.cuda.stream
+    return None, None
+
+
+def _latents_to_cpu(obj: Any) -> Any:
+    if isinstance(obj, list):
+        return [_latents_to_cpu(item) for item in obj]
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    return obj
+
+
 def _as_bcthw(item: torch.Tensor) -> torch.Tensor:
     if item.ndim == 4:
         return item.unsqueeze(0)
@@ -111,6 +143,7 @@ def encode_packed_vision_batch(
 
     encode_device = device if device is not None else _infer_tokenizer_device(tokenizer)
     _set_current_torch_device(encode_device)
+    encode_stream, encode_stream_ctx = _maybe_encode_side_stream(encode_device)
     per_camera = "enable_per_camera_vae_encoding" in batch
     sample_n_views = None
     frames_per_view = None
@@ -140,9 +173,10 @@ def encode_packed_vision_batch(
         else:
             video_5d = video_5d.to(device=encode_device, dtype=torch.float32)
         encoded = tokenizer.encode(video_5d)
-        return encoded.contiguous().float().cpu()
+        return encoded.contiguous().float()
 
-    with torch.no_grad():
+    encode_cm = encode_stream_ctx(encode_stream) if encode_stream is not None else contextlib.nullcontext()
+    with torch.no_grad(), encode_cm:
         for sample_idx, item in enumerate(items):
             clips = _unwrap_vision_sample(item)
             encoded_clips: list[torch.Tensor] = []
@@ -171,6 +205,9 @@ def encode_packed_vision_batch(
                 latents.append(encoded_clips)
             else:
                 latents.append(encoded_clips[0])
+    if encode_stream is not None:
+        encode_stream.synchronize()
+    latents = _latents_to_cpu(latents)
 
     batch[_VISION_LATENT_KEY[media_key]] = latents
     batch[_VISION_PIXEL_SHAPE_KEY[media_key]] = shapes
@@ -201,13 +238,13 @@ def custom_collate_fn(batch):
 
     # Data keys where a per-sample value of ``None`` is a meaningful signal
     # (e.g. audio extraction failed for that sample → ``sound=None`` paired
-    # with ``plan.has_sound=False``).  These keys must be kept as a list with
-    # ``None`` placeholders so the model can align per-sample data 1:1 with
-    # per-sample plans.  Dropping the entire key on any None would leave the
-    # remaining sound tensors mis-aligned with the plans whose ``has_sound``
-    # flag was set BEFORE collation, causing ``sequence_packing`` to index
-    # past the end of ``x0_tokens_sound``.
-    sparse_data_keys = {"sound"}
+    # with ``plan.has_sound=False``, or a video-only sample in an action
+    # recipe → ``action=None`` paired with ``plan.has_action=False``).
+    # These keys must be kept as a list with ``None`` placeholders so the
+    # model can align per-sample data 1:1 with per-sample plans.  Dropping
+    # the entire key on any None would leave the remaining tensors
+    # mis-aligned with the plans whose flags were set BEFORE collation.
+    sparse_data_keys = {"sound", "action", "action_raw", "domain_id", "raw_action_dim"}
 
     # Handle the case where the batch is already a dictionary (e.g. column-wise batching)
     if isinstance(batch, dict):
@@ -248,6 +285,25 @@ def custom_collate_fn(batch):
         return result
     else:
         return default_collate(batch)
+
+
+def sample_has_action(sample: dict) -> bool:
+    """Return whether a split packing sample carries action tokens.
+
+    After :meth:`JointDataLoader._get_next_sample`, ``sequence_plan`` is a
+    bare ``SequencePlan`` (not a list). ``action`` is a single-element list
+    because it is in ``_MULTI_ITEM_KEYS``. Video-only samples either omit
+    ``action`` or store ``None``.
+    """
+    plan = sample.get("sequence_plan")
+    if plan is not None and hasattr(plan, "has_action"):
+        return bool(plan.has_action)
+    action = sample.get("action")
+    if action is None:
+        return False
+    if isinstance(action, list):
+        return any(item is not None for item in action)
+    return True
 
 
 def _aggregate_worker_timing(samples: list[dict]) -> dict:
@@ -810,6 +866,7 @@ class IterativeJointDataLoader(JointDataLoader):
             skipped_samples = deque()
             lookahead_limit = self.lookahead_limits[index_id]
             lookahead_count = 0
+            pack_has_action: bool | None = None
 
             while True:
                 # Check max samples limit first
@@ -830,6 +887,14 @@ class IterativeJointDataLoader(JointDataLoader):
                     metrics.from_buffer += 1
                 else:
                     metrics.from_workers += 1
+
+                sample_action = sample_has_action(output)
+                if pack_has_action is None:
+                    pack_has_action = sample_action
+                elif sample_action != pack_has_action:
+                    skipped_samples.append(output)
+                    lookahead_count += 1
+                    continue
 
                 num_tokens_in_current_sample = self._compute_num_tokens_per_sample(output)
 
@@ -1124,6 +1189,9 @@ class PackingDataLoader(JointDataLoader):
             # PackingDataLoader wraps a single dataloader, so lookahead_limits has one entry.
             lookahead_limit = self.lookahead_limits[0]
             lookahead_count = 0
+            # Teacher-forcing expansion requires a homogeneous V+A or V-only
+            # pack. Keep the first sample's action layout and skip mismatches.
+            pack_has_action: bool | None = None
 
             while True:
                 if self.max_samples_per_batch is not None and num_samples >= self.max_samples_per_batch:
@@ -1136,6 +1204,14 @@ class PackingDataLoader(JointDataLoader):
                     output = self._get_next_sample(0)
                 except StopIteration:
                     break
+
+                sample_action = sample_has_action(output)
+                if pack_has_action is None:
+                    pack_has_action = sample_action
+                elif sample_action != pack_has_action:
+                    skipped_samples.append(output)
+                    lookahead_count += 1
+                    continue
 
                 num_tokens_in_current_sample = self._compute_num_tokens_per_sample(output)
 
@@ -1272,6 +1348,7 @@ class RandomJointDataLoader(JointDataLoader):
             skipped_samples = deque()
             lookahead_limit = self.lookahead_limits[index_id]
             lookahead_count = 0
+            pack_has_action: bool | None = None
 
             while True:
                 # Check max samples limit first
@@ -1292,6 +1369,14 @@ class RandomJointDataLoader(JointDataLoader):
                     metrics.from_buffer += 1
                 else:
                     metrics.from_workers += 1
+
+                sample_action = sample_has_action(output)
+                if pack_has_action is None:
+                    pack_has_action = sample_action
+                elif sample_action != pack_has_action:
+                    skipped_samples.append(output)
+                    lookahead_count += 1
+                    continue
 
                 num_tokens_in_current_sample = self._compute_num_tokens_per_sample(output)
 

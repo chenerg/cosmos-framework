@@ -125,17 +125,17 @@ Packing-time discard (`Discarding oversized sample` in the log) still **decodes*
 
 DROID concat 480p (`K=391` vis tokens / latent, packing `extra=500`): `max_pre_tf_tokens=48000` → **477 frames**. 8-card Edge selective AC: 120 blocks (~481 frames / ~9.6e4 post-TF packed) trains; 128 blocks / unbounded long episodes OOM. Sweep numbers: [`docs/max_episode_blocks_npu0_3_dp2_dp4_iter_time.md`](../../../docs/max_episode_blocks_npu0_3_dp2_dp4_iter_time.md).
 
-Whole-episode host-RAM extras (recipe Python / Hydra tail, not TOML schema): `dataloader_train.lookahead_limit` (Edge recipe `1`; default `10` caches extra decoded videos) and `dataloader_train.dataloader.prefetch_factor` (`2` in the Edge recipe; `1` if RSS is tight). `num_workers=4` is the 8-card 480p floor that stops data-wait; `ActionIterableShuffleDataset` wraps when `ranks × workers >` episode count.
+Whole-episode host-RAM extras (recipe Python / Hydra tail, not TOML schema): `dataloader_train.lookahead_limit` (Edge recipe `1`; default `10` caches extra decoded videos) and `dataloader_train.dataloader.prefetch_factor` (`2` is the 256p Edge default — RSS is OK; 480p used to be huge, so fall back to `1` if RSS is tight). `num_workers=4` is the 8-card 480p floor that stops data-wait; `ActionIterableShuffleDataset` wraps when `ranks × workers >` episode count.
 
-Optional VAE pre-encode on `PackingDataLoader` (Hydra tail; default off). After packing, the rank process encodes uint8 video with the model's frozen `tokenizer_vision_gen` and yields `video_latents` so `get_data_and_condition` skips encode. Trainer calls `attach_vision_tokenizer` after `model.on_train_start`.
+VAE pre-encode on `PackingDataLoader` is **on** for DROID Edge (`action_policy_droid_edge`: `encode_vision_latents=true`, `encoded_prefetch_depth=1`). After packing, the rank process encodes uint8 video with the model's frozen `tokenizer_vision_gen` on **the same** `npu:LOCAL_RANK` (a side `torch.npu.Stream`, not an extra card) and yields `video_latents` so `get_data_and_condition` skips encode. Trainer calls `attach_vision_tokenizer` after `model.on_train_start`. Other recipes still default off (class ctor `false` / `0`). Campaign + 8-card 28.17 s final: [`experiments/20260911_droid_edge_tf_opt_campaign.md`](../../../experiments/20260911_droid_edge_tf_opt_campaign.md).
 
-| Knob | Default | Meaning |
+| Knob | DROID Edge | Meaning |
 | --- | --- | --- |
-| `dataloader_train.encode_vision_latents` | `false` | Encode packed videos before yield; drop pixels unless `keep_video_pixels` |
-| `dataloader_train.encoded_prefetch_depth` | `0` | `0` = encode in `next()`. `>=1` pre-fills that many encoded batches on a producer thread so training can overlap the next encode |
+| `dataloader_train.encode_vision_latents` | `true` | Encode packed videos before yield; drop pixels unless `keep_video_pixels` |
+| `dataloader_train.encoded_prefetch_depth` | `1` | `0` = encode in `next()`. `>=1` pre-fills that many encoded batches on a producer thread so training can overlap the next encode |
 | `dataloader_train.keep_video_pixels` | `false` | Keep uint8 `video` after encode (viz only) |
 
-Do **not** construct a second VAE. On 64 GiB 910B3, `encoded_prefetch_depth=1` can OOM if next-batch pixels overlap backward; fall back to `0`. Sync encode moves `timer/encoding` into `timer/dataloader_train` and does not hide wall time. Probe: `run_bench_20step_tf_vae_pack.py`.
+Do **not** construct a second VAE or steal a spare NPU for encode. Turn off: `EXTRA_TAIL_OVERRIDES="dataloader_train.encode_vision_latents=false"`. On 64 GiB 910B3, `encoded_prefetch_depth=1` can OOM if next-batch pixels overlap backward; fall back to `0` (4-card 44.6 s vs 32.5 s — overlap still wins). Sync encode (`depth=0`) does not hide wall time. 8-card final with pack + prefetch=2 + sidestream: [`experiments/20260911_154447_8npu_droid_tf_final_pf2_stream_21step`](../../../experiments/20260911_154447_8npu_droid_tf_final_pf2_stream_21step/) avg_skip1 **28.17 s**.
 
 ### Causal teacher forcing
 
@@ -148,12 +148,12 @@ The local Edge launcher already appends `model=mot_causal_fsdp`. S/K sample Unif
 
 ### This Ascend node (Edge whole-episode)
 
-Use the conda env in repo-root [`AGENTS.md`](../../../AGENTS.md) (no `uv`; keep CANN `LD_LIBRARY_PATH`; multi-card `HCCL_OP_EXPANSION_MODE=AIV`). Local paths and the launcher:
+Use the conda env in repo-root [`AGENTS.md`](../../../AGENTS.md) (no `uv`; keep CANN `LD_LIBRARY_PATH`). HCCL stays at the default **AI_CPU** — do **not** export `HCCL_OP_EXPANSION_MODE=AIV`. Multi-card: set `HCCL_NPU_SOCKET_PORT_RANGE` so AI_CPU does not collide on the default 16666 bind. Local paths and the launcher:
 
 ```bash
 # from cosmos/cookbooks/cosmos3/generator/action/finetune/
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
-  HCCL_OP_EXPANSION_MODE=AIV \
+  HCCL_NPU_SOCKET_PORT_RANGE=35100-35200 \
   bash launch_sft_action_policy_droid_edge_local.sh
 ```
 

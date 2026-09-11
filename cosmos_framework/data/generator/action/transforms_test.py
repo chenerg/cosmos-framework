@@ -230,6 +230,36 @@ def test_action_transform_pipeline_keeps_ai_caption_string_path() -> None:
 
 
 @pytest.mark.L0
+def test_action_transform_pipeline_image2video_drops_action() -> None:
+    pipeline = ActionTransformPipeline(
+        tokenizer_config=None,
+        max_action_dim=4,
+        format_prompt_as_json=True,
+    )
+    video = torch.zeros(3, 17, 256, 256)  # [C,T,H,W]
+    action = torch.zeros(16, 2)  # [T,D]
+    data_dict = {
+        "ai_caption": "Open the drawer.",
+        "video": video,
+        "action": action,
+        "conditioning_fps": torch.tensor(8),
+        "mode": "image2video",
+        "domain_id": torch.tensor(0),
+        "viewpoint": "third_person_view",
+        "idle_frames": torch.tensor(3),
+    }
+
+    result = pipeline(data_dict, resolution="256")
+
+    assert result["sequence_plan"].has_action is False
+    assert result["sequence_plan"].has_vision is True
+    assert result["action"] is None
+    assert result["action_raw"] is None
+    assert result["domain_id"] is None
+    assert result["raw_action_dim"] is None
+
+
+@pytest.mark.L0
 def test_action_transform_pipeline_keeps_idle_frames_for_forward_dynamics() -> None:
     pipeline = ActionTransformPipeline(
         tokenizer_config=None,

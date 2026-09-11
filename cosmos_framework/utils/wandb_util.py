@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+import socket
+from typing import TYPE_CHECKING, Any
 
 import attrs
 import wandb
@@ -69,61 +70,62 @@ def init_wandb(config: Config, model: ImaginaireModel) -> None:
         config_resolved = easy_io.load(local_safe_yaml_fp)
     else:
         config_resolved = attrs.asdict(config)
-    # Initialize the wandb library. If we attempt to resume an existing run
-    # but the current user does not have permission to update that run
-    # (common when re-using an ID created by someone else), fall back to
-    # creating a fresh run ID and re-initializing.
+
+    mode = config_job.wandb_mode
     try:
-        wandb.init(
-            force=True,
-            id=wandb_id,
-            project=config_job.project,
-            group=config_job.group,
-            name=config_job.name,
-            config=config_resolved,
-            dir=config_job.path_local,
-            resume="allow",
-            mode=config_job.wandb_mode,
-        )
+        if mode == "online" and not _wandb_ai_reachable():
+            raise OSError("api.wandb.ai:443 unreachable")
+        _wandb_init(config_job, config_resolved, wandb_id=wandb_id, mode=mode)
     except Exception as e:
-        # Detect common permission / upload errors from wandb and recover
-        msg = str(e)
-        if (
-            "member role does not have Update Run permission" in msg
-            or "Error uploading run" in msg
-            or "returned error 403" in msg
+        if mode == "online":
+            log.warning("W&B online unusable (%s); falling back to offline mode.", e)
+            _wandb_init(config_job, config_resolved, wandb_id=wandb_id, mode="offline")
+        elif (
+            "member role does not have Update Run permission" in str(e)
+            or "Error uploading run" in str(e)
+            or "returned error 403" in str(e)
         ):
             log.warning("W&B run exists but current user lacks update permission; starting a new run instead.")
-            # Generate and persist a new wandb id, then create a fresh run.
             wandb_id = _generate_wandb_id()
             _write_wandb_id(config_job, config_checkpoint, wandb_id=wandb_id)
-            wandb.init(
-                force=True,
-                id=wandb_id,
-                project=config_job.project,
-                group=config_job.group,
-                name=config_job.name,
-                config=config_resolved,
-                dir=config_job.path_local,
-                mode=config_job.wandb_mode,
-            )
-        elif "returned error 401" in msg or "user is not logged in" in msg:
-            log.warning("W&B authentication failed (401); falling back to offline mode. Error: %s", msg)
-            wandb.init(
-                force=True,
-                id=wandb_id,
-                project=config_job.project,
-                group=config_job.group,
-                name=config_job.name,
-                config=config_resolved,
-                dir=config_job.path_local,
-                mode="offline",
-            )
+            _wandb_init(config_job, config_resolved, wandb_id=wandb_id, mode=mode, resume=None)
         else:
             raise
 
     if wandb.run:
         wandb.run.config.update({f"JOB_INFO/{k}": v for k, v in JOB_INFO.items()}, allow_val_change=True)
+
+
+def _wandb_ai_reachable(timeout_s: float = 5.0) -> bool:
+    """Return True if TCP 443 to api.wandb.ai succeeds within ``timeout_s``."""
+    try:
+        socket.create_connection(("api.wandb.ai", 443), timeout=timeout_s).close()
+        return True
+    except OSError:
+        return False
+
+
+def _wandb_init(
+    config_job: JobConfig,
+    config_resolved: Any,
+    *,
+    wandb_id: str,
+    mode: str,
+    resume: str | None = "allow",
+) -> None:
+    kwargs: dict[str, Any] = dict(
+        force=True,
+        id=wandb_id,
+        project=config_job.project,
+        group=config_job.group,
+        name=config_job.name,
+        config=config_resolved,
+        dir=config_job.path_local,
+        mode=mode,
+    )
+    if resume is not None:
+        kwargs["resume"] = resume
+    wandb.init(**kwargs)
 
 
 def _read_wandb_id(config_job: JobConfig, config_checkpoint: CheckpointConfig) -> str | None:

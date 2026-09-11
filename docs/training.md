@@ -222,7 +222,7 @@ python -m cosmos_framework.scripts.convert_model_to_vlm_safetensors \
 
 ## Step 3 — Run training
 
-**Weights & Biases (optional):** every recipe TOML defaults to `job.wandb_mode = "disabled"`. To log a run to W&B, flip that field to `"online"` in the TOML and export `WANDB_API_KEY` in your environment before launching.
+**Weights & Biases:** the schema default is `job.wandb_mode = "online"`. Export `WANDB_API_KEY` to log to W&B; if online cannot be used (unreachable `api.wandb.ai`, auth, 403, …), training falls back to `"offline"` (local `wandb/` dir, sync later with `wandb sync`). Set `"disabled"` in the TOML to skip W&B entirely. Some vision recipes still pin `"disabled"` explicitly.
 
 ### Option A (recommended): the paired launch shell
 
@@ -419,7 +419,7 @@ The commonly tuned knobs:
     1. `task` — `"vfm"` (generator recipes) or `"vlm"` (Reasoner alignment). Picks the base config: `cosmos_framework/configs/base/config.py` vs `…/vlm/config.py`. Also drives `PATH_REMAPS` in `toml_config_helper.py`.
     1. `experiment` — Registered experiment SKU name (e.g. `vision_sft_nano`). Each SKU is a Python file under `cosmos_framework/configs/base/experiment/sft/` that wires up dataloader, model variant, and recipe-specific defaults.
     1. `project`, `group`, `name` — Components of the run output dir `$IMAGINAIRE_OUTPUT_ROOT/<project>/<group>/<name>/`. Also flow to W&B as the project / group / run name.
-    1. `wandb_mode` — `"online"` (logs to W&B; `WANDB_API_KEY` must be set), `"offline"` (logs locally, sync later with `wandb sync`), or `"disabled"`.
+    1. `wandb_mode` — `"online"` (logs to W&B; `WANDB_API_KEY` must be set; any failure to use online falls back to offline), `"offline"` (logs locally, sync later with `wandb sync`), or `"disabled"`.
 1. `[model]`
     1. `max_num_tokens_after_packing` — VFM token-packing target. `-1` disables the cap. VFM only; VLM uses `data_setting.max_tokens` (tail override).
     1. `joint_attn_implementation` — VFM attention layout: `"two_way"` / `"three_way"` (NATTEN) / `"teacher_forcing"`.

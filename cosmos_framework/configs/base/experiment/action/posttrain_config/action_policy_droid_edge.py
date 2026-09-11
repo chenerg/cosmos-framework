@@ -81,7 +81,7 @@ action_policy_droid_edge = LazyDict(
             project="cosmos3",
             group="action_sft",
             name="action_policy_droid_edge",
-            wandb_mode="disabled",
+            wandb_mode="online",
         ),
         model=dict(
             config=_action_policy_droid_edge_model_config(),

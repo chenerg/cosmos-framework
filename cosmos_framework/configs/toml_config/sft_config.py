@@ -76,9 +76,10 @@ class JobConfig(BaseModel):
         ),
     )
     wandb_mode: str = Field(
-        default="disabled",
+        default="online",
         description=(
-            "Wandb upload mode: 'online' (real-time, needs WANDB_API_KEY), "
+            "Wandb upload mode: 'online' (real-time, needs WANDB_API_KEY; "
+            "any failure to use online falls back to offline), "
             "'offline' (log locally, sync later with `wandb sync`), or "
             "'disabled' (no wandb at all)."
         ),

@@ -361,11 +361,14 @@ class ModelConfig(BaseModel):
         ge=1,
         description="Inclusive maximum clean-history window measured in causal blocks.",
     )
-    teacher_forcing_dense_mode: Literal["global", "per_sample"] = Field(
-        default="global",
+    teacher_forcing_dense_mode: Literal["tnd", "per_sample", "global"] = Field(
+        default="tnd",
         description=(
-            "Retained for recipe compatibility. Scheme-B GEN attention gathers per-block KV "
-            "slices and runs unmasked SDPA; 'global' and 'per_sample' no longer select a dense-mask kernel."
+            "Scheme-B GEN attention kernel. 'tnd' gathers per-block visible KV and runs packed "
+            "varlen attention (Ascend TND / npu_fusion_attention). 'per_sample' runs one "
+            "masked SDPA per packed sample. 'global' runs one masked SDPA over the whole pack. "
+            "UND causal attention is varlen in all three modes. 'global' allocates a dense "
+            "[Q, KV] bool mask and is an HBM footgun on long packed sequences."
         ),
     )
     teacher_forcing_visualize_sdpa_mask: bool = Field(

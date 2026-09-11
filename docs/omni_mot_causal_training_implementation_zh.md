@@ -503,49 +503,55 @@ attention 级分解，不等同于上述 clean pre-forward + 可微 KV memory �
 内部空洞。它还依赖后端提供可用于精确合并且反向正确的 LSE。当前没有完成该能力的 NPU
 forward/backward 验证，因此不作为近期实现基础。
 
-### 7.9 Scheme B 的逐 packed sample Dense 模式
+### 7.9 Scheme B 的三种 GEN attention 配置
 
-在不改变 Scheme B 训练语义的前提下，可以利用不同 packed samples 原本就完全隔离这一
-性质，把一张全局 block-diagonal Dense Mask 拆成每条样本一张局部 mask：
-
-```text
-global:
-Q=[GEN_A|GEN_B] x KV=[ALL_A|ALL_B] -> one masked SDPA
-
-per_sample:
-GEN_A x ALL_A -> masked SDPA A
-GEN_B x ALL_B -> masked SDPA B
-outputs = concat([A, B])
-```
-
-该模式由以下配置切换：
+`teacher_forcing_dense_mode` 选择 GEN kernel，不改变 Scheme B 可见性语义。UND causal
+attention 在三种模式下都是 packed varlen。默认值是 `tnd`。
 
 ```toml
-teacher_forcing_dense_mode = "global"      # 正确性基线，默认值
-teacher_forcing_dense_mode = "per_sample"  # 跳过跨样本 QK 区域
+teacher_forcing_dense_mode = "tnd"         # 生产路径：block-gather + packed varlen TND
+teacher_forcing_dense_mode = "per_sample"  # 每条 packed sample 一次 masked SDPA
+teacher_forcing_dense_mode = "global"      # 整包一张 Dense Mask，一次 masked SDPA
 ```
 
-`per_sample` 只循环 GEN attention；Norm、QKV projection、UND causal attention、output
-projection 和 MLP 仍对完整 packing 一次执行。它不会引入 Scheme A 的 clean pre-forward
-或 KV cache，也不会消除单条样本内部由 clean/noisy 与历史窗口形成的空洞。
+```text
+tnd:
+  每个 (sample, block, stream) 是一个 varlen segment
+  Q_j 只对 gather 出的同样本可见 KV_j 做 unmasked attention
+  多样本拼进同一次（或按 segment/KV 预算切成几次）TND 调用
 
-设 packing 中各样本分别有 `Ui` 个 UND token 和 `Vi` 个原始视觉 token，attention 主
-计算量从：
+global:
+  Q=[GEN_A|GEN_B] x KV=[ALL_A|ALL_B] -> one masked SDPA
+
+per_sample:
+  GEN_A x ALL_A -> masked SDPA A
+  GEN_B x ALL_B -> masked SDPA B
+  outputs = concat([A, B])
+```
+
+`tnd` 与 `per_sample` 都不计算跨样本 QK。`tnd` 更细：可见性由每 block 的 KV gather
+编码，不分配 Dense Mask；同一份 UND/history KV 会按 group 复制。`global` 用
+`same_sample` bit 遮掉跨样本区域，但仍计算那些 QK。`global` 的 `[Q, KV]` bool mask
+在长 packing 上是 HBM 风险，不要作为 DROID 48k 默认。
+
+三种模式都只替换 GEN attention。Norm、QKV projection、UND causal attention、output
+projection 和 MLP 仍对完整 packing 一次执行。
+
+设 packing 中各样本分别有 `Ui` 个 UND token 和 `Vi` 个原始视觉 token，masked SDPA
+主计算量从：
 
 ```text
 global:     2 * sum(Vi) * [sum(Ui) + 2*sum(Vi)]
 per_sample: sum(2*Vi * [Ui + 2*Vi])
 ```
 
-下降部分正是跨样本、最终被 `same_sample` mask 排除的 QK 区域。代价是每层 GEN
-attention 的 kernel 调用数从 1 增加为 packed sample 数，可能降低单 kernel MFU。因此
-性能判断应以 step time 和有效 tokens/s 为主，而不是只观察硬件 MFU。
+`tnd` 再去掉样本内部被历史窗口挡住的空洞，近似 `sum(2*Vi * [Ui + (K+1)P])`。
 
-实现保留全局 Dense Mask 构造函数作为 oracle。局部 mask 必须逐样本直接构造，不能先
-分配全局 mask 再切片，否则无法获得 mask 峰值显存收益。对应实现位置：
+实现按所选模式只构造对应 metadata，不预先分配另外两种。对应实现位置：
 
-- [`build_per_sample_teacher_forcing_gen_masks()`](../cosmos_framework/data/generator/sequence_packing/teacher_forcing.py)；
-- [`teacher_forcing_per_sample_dense_attention()`](../cosmos_framework/model/generator/mot/teacher_forcing_attention.py)；
+- [`build_teacher_forcing_block_attention_groups()`](../cosmos_framework/data/generator/sequence_packing/teacher_forcing.py)（`tnd`）；
+- [`build_per_sample_teacher_forcing_gen_masks()`](../cosmos_framework/data/generator/sequence_packing/teacher_forcing.py)（`per_sample`）；
+- [`build_dense_teacher_forcing_gen_mask()`](../cosmos_framework/data/generator/sequence_packing/teacher_forcing.py)（`global` / oracle）；
 - [`teacher_forcing_attention()`](../cosmos_framework/model/generator/mot/attention.py)。
 
 ## 8. 已完成的代码模块
@@ -556,7 +562,7 @@ attention 的 kernel 调用数从 1 增加为 packed sample 数，可能降低�
 4. PackedSequence 双流扩展：支持不同视频长度的 packed batch。
 5. clean/noisy 相同 RoPE position IDs。
 6. clean timestep=0、noisy timestep=t。
-7. global 模式使用一次 Dense SDPA；per-sample 模式每条样本独立 softmax；均支持显式 GQA KV head 扩展。
+7. `tnd` 使用 block-gather packed varlen；`per_sample` / `global` 使用 masked SDPA；均支持显式 GQA KV head 扩展。
 8. 只恢复 noisy output，复用原 decoder/loss。
 9. 独立 `mot_causal_ddp` / `mot_causal_fsdp` 模型组和 TOML 字段。
 10. 小模型 CPU forward/backward 与梯度闭环测试。

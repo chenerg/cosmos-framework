@@ -28,6 +28,7 @@ from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
 )
 from cosmos_framework.model.attention.backends import BACKEND_CHECK_MAP
 from cosmos_framework.model.attention.frontend import BACKEND_MAP
+from cosmos_framework.model.generator.mot import attention as attention_mod
 from cosmos_framework.model.generator.mot.attention import (
     TeacherForcingAttentionInfo,
     build_packed_sequence,
@@ -163,7 +164,7 @@ def test_teacher_forcing_dense_attention_can_skip_redundant_mask_content_validat
     assert captured_backend_kwargs["validate_allowed_mask"] is False
 
 
-def _make_teacher_forcing_packs(dense_mode: str = "global"):
+def _make_teacher_forcing_packs(dense_mode: str = "tnd"):
     layout = build_teacher_forcing_layout(
         und_token_counts=[1, 2],
         vision_token_shapes=[(2, 1, 1), (1, 1, 2)],
@@ -198,8 +199,11 @@ def test_build_packed_sequence_constructs_teacher_forcing_attention_info_without
 
     assert isinstance(attention_meta, TeacherForcingAttentionInfo)
     assert attention_meta.layout is layout
+    assert attention_meta.dense_mode == "tnd"
     assert attention_meta.dense_gen_mask is None
+    assert attention_meta.sample_gen_masks == ()
     assert attention_meta.block_groups == build_teacher_forcing_block_attention_groups(layout)
+    assert attention_meta.kv_gather_index is not None
     assert natten_metadata is None
 
 
@@ -269,8 +273,24 @@ def test_build_packed_sequence_constructs_per_sample_masks_without_global_mask()
     assert isinstance(attention_meta, TeacherForcingAttentionInfo)
     assert attention_meta.dense_mode == "per_sample"
     assert attention_meta.dense_gen_mask is None
+    expected_masks = build_per_sample_teacher_forcing_gen_masks(layout)
+    assert len(attention_meta.sample_gen_masks) == len(expected_masks)
+    for actual, expected in zip(attention_meta.sample_gen_masks, expected_masks, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert attention_meta.block_groups == ()
+    assert attention_meta.kv_gather_index is None
+    assert natten_metadata is None
+
+
+def test_build_packed_sequence_constructs_global_mask_without_per_sample_masks():
+    layout, _, _, _, _, _, _, attention_meta, natten_metadata = _make_teacher_forcing_packs("global")
+
+    assert isinstance(attention_meta, TeacherForcingAttentionInfo)
+    assert attention_meta.dense_mode == "global"
+    torch.testing.assert_close(attention_meta.dense_gen_mask, build_dense_teacher_forcing_gen_mask(layout))
     assert attention_meta.sample_gen_masks == ()
-    assert attention_meta.block_groups == build_teacher_forcing_block_attention_groups(layout)
+    assert attention_meta.block_groups == ()
+    assert attention_meta.kv_gather_index is None
     assert natten_metadata is None
 
 
@@ -331,8 +351,9 @@ def test_visualize_dense_teacher_forcing_gen_mask_distinguishes_action_tokens(tm
     assert (186, 104, 240) in colors  # NOISY action
 
 
-def test_dispatch_teacher_forcing_attention_matches_unified_dense_gen_attention():
-    layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs()
+@pytest.mark.parametrize("dense_mode", ["tnd", "per_sample", "global"])
+def test_dispatch_teacher_forcing_attention_matches_unified_dense_gen_attention(dense_mode):
+    layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs(dense_mode)
 
     output_pack, kv_to_store = dispatch_attention(
         query_pack,
@@ -349,21 +370,46 @@ def test_dispatch_teacher_forcing_attention_matches_unified_dense_gen_attention(
     ).flatten(-2, -1)
     torch.testing.assert_close(get_gen_seq(output_pack)[: expected_gen.shape[0]], expected_gen)
     assert kv_to_store is None
+    assert attention_meta.dense_mode == dense_mode
 
 
-def test_dispatch_per_sample_teacher_forcing_attention_matches_unified_dense_gen_attention():
-    layout, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs("per_sample")
+@pytest.mark.parametrize(
+    ("dense_mode", "expected_kernel"),
+    [
+        ("tnd", "teacher_forcing_block_gather_attention"),
+        ("per_sample", "teacher_forcing_per_sample_dense_attention"),
+        ("global", "teacher_forcing_dense_attention"),
+    ],
+)
+def test_dispatch_selects_gen_kernel_for_dense_mode(dense_mode, expected_kernel, monkeypatch):
+    called: list[str] = []
 
-    output_pack, kv_to_store = dispatch_attention(query_pack, key_pack, value_pack, attention_meta)
-    expected_gen = teacher_forcing_dense_attention(
-        get_all_seq(query_pack)[layout.gen_query_indexes],
-        get_all_seq(key_pack),
-        get_all_seq(value_pack),
-        build_dense_teacher_forcing_gen_mask(layout),
-    ).flatten(-2, -1)
+    def _wrap(name, impl):
+        def wrapper(*args, **kwargs):
+            called.append(name)
+            return impl(*args, **kwargs)
 
-    torch.testing.assert_close(get_gen_seq(output_pack)[: expected_gen.shape[0]], expected_gen)
-    assert kv_to_store is None
+        return wrapper
+
+    monkeypatch.setattr(
+        attention_mod,
+        "teacher_forcing_block_gather_attention",
+        _wrap("teacher_forcing_block_gather_attention", teacher_forcing_block_gather_attention),
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "teacher_forcing_per_sample_dense_attention",
+        _wrap("teacher_forcing_per_sample_dense_attention", teacher_forcing_per_sample_dense_attention),
+    )
+    monkeypatch.setattr(
+        attention_mod,
+        "teacher_forcing_dense_attention",
+        _wrap("teacher_forcing_dense_attention", teacher_forcing_dense_attention),
+    )
+
+    _, _, _, _, query_pack, key_pack, value_pack, attention_meta, _ = _make_teacher_forcing_packs(dense_mode)
+    dispatch_attention(query_pack, key_pack, value_pack, attention_meta)
+    assert called == [expected_kernel]
 
 
 def test_dispatch_teacher_forcing_attention_uses_normalized_und_keys_for_gen():
@@ -388,6 +434,32 @@ def test_dispatch_teacher_forcing_attention_uses_normalized_und_keys_for_gen():
         build_dense_teacher_forcing_gen_mask(layout),
     ).flatten(-2, -1)
     torch.testing.assert_close(get_gen_seq(output_pack)[: expected_gen.shape[0]], expected_gen)
+
+
+def test_build_packed_sequence_rejects_invalid_teacher_forcing_dense_mode():
+    layout = build_teacher_forcing_layout(
+        und_token_counts=[1],
+        vision_token_shapes=[(2, 1, 1)],
+        block_size=1,
+        history_blocks=1,
+    )
+    packed_sequence = torch.randn(sum(layout.sample_lens), 4, 3)
+
+    with pytest.raises(ValueError, match="teacher_forcing_dense_mode"):
+        build_packed_sequence(
+            "teacher_forcing",
+            packed_sequence=packed_sequence,
+            attn_modes=list(layout.attn_modes),
+            split_lens=list(layout.split_lens),
+            sample_lens=list(layout.sample_lens),
+            packed_und_token_indexes=torch.nonzero(layout.stream_ids == -1, as_tuple=True)[0],
+            packed_gen_token_indexes=layout.gen_query_indexes,
+            num_heads=4,
+            head_dim=3,
+            num_layers=1,
+            teacher_forcing_layout=layout,
+            teacher_forcing_dense_mode="invalid",
+        )
 
 
 def test_build_packed_sequence_rejects_teacher_forcing_layout_geometry_mismatch():

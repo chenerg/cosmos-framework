@@ -110,7 +110,9 @@ def test_network_config_keeps_dense_mode_explicit():
 
     assert config.teacher_forcing_dense_mode == "per_sample"
     assert config.teacher_forcing_visualize_sdpa_mask is True
-    assert Cosmos3VFMNetworkConfig().teacher_forcing_dense_mode == "global"
+    assert Cosmos3VFMNetworkConfig().teacher_forcing_dense_mode == "tnd"
+    assert Cosmos3VFMNetworkConfig(teacher_forcing_dense_mode="tnd").teacher_forcing_dense_mode == "tnd"
+    assert Cosmos3VFMNetworkConfig(teacher_forcing_dense_mode="global").teacher_forcing_dense_mode == "global"
     assert Cosmos3VFMNetworkConfig().teacher_forcing_visualize_sdpa_mask is False
 
     with pytest.raises(ValueError, match="teacher_forcing_dense_mode"):

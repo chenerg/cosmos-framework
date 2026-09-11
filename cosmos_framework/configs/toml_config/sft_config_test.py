@@ -22,6 +22,7 @@ def _resolve_target(target):
     """Hydra/LazyCall may store ``_target_`` as a class or a qualified-name string."""
     return locate(target) if isinstance(target, str) else target
 
+
 # Representative payload: scalars, a nested sub-table, and an array-of-tables.
 _CUSTOM_PAYLOAD = {
     "scalar_int": 5,
@@ -83,6 +84,14 @@ class TestSchemaValidation:
         assert cfg.model.causal_training_strategy == "teacher_forcing"
         assert cfg.model.teacher_forcing_dense_mode == "per_sample"
         assert cfg.model.teacher_forcing_visualize_sdpa_mask is True
+
+        default_cfg = SFTExperimentConfig.model_validate({"job": {"task": "vfm", "experiment": "vision_sft_edge"}})
+        assert default_cfg.model.teacher_forcing_dense_mode == "tnd"
+
+        tnd_cfg = SFTExperimentConfig.model_validate(
+            {"job": {"task": "vfm", "experiment": "vision_sft_edge"}, "model": {"teacher_forcing_dense_mode": "tnd"}}
+        )
+        assert tnd_cfg.model.teacher_forcing_dense_mode == "tnd"
 
     def test_vfm_rejects_both_packing_caps(self) -> None:
         with pytest.raises(ValidationError, match="exactly one of"):
@@ -400,7 +409,7 @@ load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
         assert config.model.config.teacher_forcing_block_size_max == 4
         assert config.model.config.teacher_forcing_history_blocks_min == 1
         assert config.model.config.teacher_forcing_history_blocks_max == 32
-        assert config.model.config.teacher_forcing_dense_mode == "global"
+        assert config.model.config.teacher_forcing_dense_mode == "tnd"
 
     def test_load_with_custom_section(self, tmp_path: Path, _dummy_recipe_env: None) -> None:
         toml_path = tmp_path / "with_custom.toml"

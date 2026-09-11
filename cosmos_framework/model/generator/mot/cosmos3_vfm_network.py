@@ -17,6 +17,7 @@ from cosmos_framework.data.generator.sequence_packing.teacher_forcing import (
     build_dense_teacher_forcing_gen_mask,
     visualize_dense_teacher_forcing_gen_mask,
 )
+from cosmos_framework.model.generator.causal_teacher_forcing import TEACHER_FORCING_GEN_ATTN_MODES
 from cosmos_framework.model.generator.mot.attention import (
     SplitInfo,
     build_packed_sequence,
@@ -60,7 +61,7 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         temporal_compression_factor_action=1,
         natten_parameter_list=None,
         video_temporal_causal=False,
-        teacher_forcing_dense_mode: str = "global",
+        teacher_forcing_dense_mode: str = "tnd",
         teacher_forcing_visualize_sdpa_mask: bool = False,
         # Sound generation parameters
         sound_dim: int | None = None,
@@ -90,9 +91,10 @@ class Cosmos3VFMNetworkConfig(PretrainedConfig):
         self.temporal_compression_factor_vision = temporal_compression_factor_vision
         self.natten_parameter_list = natten_parameter_list
         self.video_temporal_causal = video_temporal_causal
-        if teacher_forcing_dense_mode not in {"global", "per_sample"}:
+        if teacher_forcing_dense_mode not in TEACHER_FORCING_GEN_ATTN_MODES:
             raise ValueError(
-                "teacher_forcing_dense_mode must be 'global' or 'per_sample', "
+                "teacher_forcing_dense_mode must be one of "
+                f"{sorted(TEACHER_FORCING_GEN_ATTN_MODES)}, "
                 f"got {teacher_forcing_dense_mode!r}"
             )
         self.teacher_forcing_dense_mode = teacher_forcing_dense_mode

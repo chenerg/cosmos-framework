@@ -14,6 +14,10 @@ from cosmos_framework.data.generator.sequence_packing import (
     sample_teacher_forcing_geometry,
 )
 
+# GEN attention kernel selected by ``teacher_forcing_dense_mode``.
+# ``tnd``: block-gather packed varlen (TND on NPU). ``per_sample`` / ``global``: masked SDPA.
+TEACHER_FORCING_GEN_ATTN_MODES = frozenset({"tnd", "per_sample", "global"})
+
 
 class _ParallelismConfig(Protocol):
     context_parallel_shard_degree: int
@@ -71,9 +75,10 @@ def validate_teacher_forcing_config(config: TeacherForcingConfig) -> None:
             "teacher-forcing history_blocks range must satisfy 1 <= min <= max, "
             f"got {config.teacher_forcing_history_blocks_min}..{config.teacher_forcing_history_blocks_max}"
         )
-    if config.teacher_forcing_dense_mode not in {"global", "per_sample"}:
+    if config.teacher_forcing_dense_mode not in TEACHER_FORCING_GEN_ATTN_MODES:
         raise ValueError(
-            "teacher_forcing_dense_mode must be 'global' or 'per_sample', "
+            "teacher_forcing_dense_mode must be one of "
+            f"{sorted(TEACHER_FORCING_GEN_ATTN_MODES)}, "
             f"got {config.teacher_forcing_dense_mode!r}"
         )
 

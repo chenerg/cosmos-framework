@@ -100,7 +100,7 @@ Robot policy SFT is still `[job].task = "vfm"` + `python -m cosmos_framework.scr
 
 `DROID_ROOT` is the **versioned parent** that contains `success/` (basename must match a `LEROBOT_ROOTS` key, e.g. `droid_plus_lerobot_640x360_20260412`), not `.../success` itself. `LIBERO_ROOT` is the suite dir (`.../libero_10`) or the four-suite parent for the all recipe.
 
-Shared recipe knobs: `action_space=joint_pos` (DROID 8D) or `frame_wise_relative` (LIBERO), `use_state=True`, `mode=policy` (not `joint` multi-task), `format_prompt_as_json=True`, `viewpoint=concat_view`, `resolution=480`. Policy JSON omits clip `duration` and `actions[].time` so train/infer stay causal-safe; FD/ID keep the timeline.
+Shared recipe knobs: `action_space=joint_pos` (DROID 8D) or `frame_wise_relative` (LIBERO), `use_state=True`, `mode=policy` (not `joint` multi-task), `format_prompt_as_json=True`, `viewpoint=concat_view`, `resolution=480`. Policy JSON omits clip `duration` and `actions[].time` so train/infer stay causal-safe; FD/ID keep the timeline. `teacher_forcing_dense_mode` selects the GEN kernel: `tnd` (default; packed varlen TND), `per_sample` (masked SDPA per packed sample), `global` (one dense masked SDPA; HBM-heavy on long packs).
 
 ### PackingDataLoader batch sizing
 
@@ -141,8 +141,8 @@ Do **not** construct a second VAE. On 64 GiB 910B3, `encoded_prefetch_depth=1` c
 
 Scheme-B causal training needs **both**:
 
-1. TOML `[model] causal_training_strategy = "teacher_forcing"` (plus `teacher_forcing_block_size_{min,max}`, `teacher_forcing_history_blocks_{min,max}`, `teacher_forcing_dense_mode`)
-2. Hydra model group `model=mot_causal_fsdp` (or `mot_causal_ddp`). Recipe defaults are `mot_fsdp`; TOML alone is not enough.
+1. TOML `[model] causal_training_strategy = "teacher_forcing"` (plus `teacher_forcing_block_size_{min,max}`, `teacher_forcing_history_blocks_{min,max}`, `teacher_forcing_dense_mode` = `tnd` | `per_sample` | `global`)
+2. Hydra model group `model=mot_causal_fsdp` (or `mot_causal_ddp`). Recipe defaults are `mot_fsdp`; TOML alone is not enough. The local DROID Edge recipe defaults to `tnd`. Switch without editing the TOML: `EXTRA_TAIL_OVERRIDES="model.config.teacher_forcing_dense_mode=per_sample"`.
 
 The local Edge launcher already appends `model=mot_causal_fsdp`. S/K sample Uniform unless min=max is pinned.
 

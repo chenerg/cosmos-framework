@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-import contextlib
 import math
-import queue
-import threading
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -33,187 +30,75 @@ _BATCH_TIMING_KEYS = {
     "_worker_id",
 }
 
-_VISION_LATENT_KEY = {"video": "video_latents", "images": "image_latents"}
-_VISION_PIXEL_SHAPE_KEY = {"video": "video_pixel_shapes", "images": "image_pixel_shapes"}
-_ENCODED_QUEUE_SENTINEL = object()
+
+def _scalar_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        return int(value.item())
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
 
 
-def _infer_tokenizer_device(tokenizer: Any) -> torch.device:
-    """Device of the frozen vision tokenizer weights.
-
-    Prefer ``parameters().device`` over ``WanVAE.device``. The latter is often
-    the unindexed ``npu``/``cuda`` enum, which becomes ``npu:0`` and mismatches
-    rank-local weights on ``npu:LOCAL_RANK``.
-    """
-    inner = getattr(tokenizer, "model", None)
-    model = getattr(inner, "model", inner)
-    params = getattr(model, "parameters", None)
-    if callable(params):
-        try:
-            return next(params()).device
-        except StopIteration:
-            pass
-    device = getattr(inner, "device", None)
-    if device is None:
-        device = getattr(tokenizer, "device", None)
-    if device is None:
-        device = torch.device("cpu")
-    return torch.device(device) if not isinstance(device, torch.device) else device
+def _as_list(value: Any) -> list[Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    return [value]
 
 
-def _set_current_torch_device(device: torch.device) -> None:
-    if device.type == "cpu":
-        return
-    if device.type == "npu" and hasattr(torch, "npu"):
-        torch.npu.set_device(device)
-    elif device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.set_device(device)
-
-
-def _maybe_encode_side_stream(device: torch.device):
-    """VAE-encode stream so encode kernels do not occupy the default HCCL stream.
-
-    Returns ``(stream, stream_context)``. CPU and missing stream APIs return
-    ``(None, None)`` so tests and CPU dataloaders keep working.
-    """
-    if device.type == "cpu":
-        return None, None
-    if device.type == "npu" and hasattr(torch, "npu"):
-        npu = torch.npu
-        if (
-            callable(getattr(npu, "is_available", None))
-            and npu.is_available()
-            and hasattr(npu, "Stream")
-            and hasattr(npu, "stream")
-        ):
-            return npu.Stream(device=device), npu.stream
-        return None, None
-    if device.type == "cuda" and torch.cuda.is_available() and hasattr(torch.cuda, "Stream"):
-        return torch.cuda.Stream(device=device), torch.cuda.stream
-    return None, None
-
-
-def _latents_to_cpu(obj: Any) -> Any:
-    if isinstance(obj, list):
-        return [_latents_to_cpu(item) for item in obj]
-    if isinstance(obj, torch.Tensor):
-        return obj.cpu()
-    return obj
-
-
-def _as_bcthw(item: torch.Tensor) -> torch.Tensor:
-    if item.ndim == 4:
-        return item.unsqueeze(0)
-    if item.ndim == 5:
-        return item
-    raise ValueError(f"Vision tensor must be [C,T,H,W] or [B,C,T,H,W], got shape {tuple(item.shape)}")
-
-
-def _unwrap_vision_sample(item: Any) -> list[torch.Tensor]:
-    if isinstance(item, torch.Tensor):
-        return [item]
+def _vision_placeholder(item: Any) -> bool:
+    if item is None:
+        return True
     if isinstance(item, (list, tuple)):
-        tensors = [elem for elem in item if elem is not None]
-        if not tensors:
-            raise ValueError("Vision sample is empty")
-        return tensors
-    raise TypeError(f"Unsupported vision sample type: {type(item)}")
+        return all(_vision_placeholder(x) for x in item)
+    return False
 
 
-def encode_packed_vision_batch(
-    batch: dict,
-    tokenizer: Any,
-    *,
-    keep_video_pixels: bool = False,
-    device: torch.device | None = None,
-) -> dict:
-    """VAE-encode packed ``video`` / ``images`` in-place and optionally drop pixels.
+def _collated_batch_size(batch: dict) -> int:
+    is_image_batch = "images" in batch
+    media = batch.get("images" if is_image_batch else "video")
+    if media is not None:
+        return len(media)
+    for key in ("video_latents", "image_latents", "action", "episode_index"):
+        value = batch.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 1
 
-    Writes ``video_latents`` (or ``image_latents``), ``video_pixel_shapes``, and
-    ``vae_latents_ready=True``. Latents are moved to CPU so a prefetch queue does
-    not pin extra device memory across training steps.
-    """
-    media_key = "images" if "images" in batch else "video" if "video" in batch else None
-    if media_key is None:
+
+def _finalize_packed_vision_latents(batch: dict) -> dict:
+    """Attach flags for dataset-loaded VAE latents. Does not run Wan VAE."""
+    latents = batch.get("video_latents")
+    if not latents:
         return batch
-
-    items = batch[media_key]
-    if not isinstance(items, list):
-        items = [items]
-
-    encode_device = device if device is not None else _infer_tokenizer_device(tokenizer)
-    _set_current_torch_device(encode_device)
-    encode_stream, encode_stream_ctx = _maybe_encode_side_stream(encode_device)
-    per_camera = "enable_per_camera_vae_encoding" in batch
-    sample_n_views = None
-    frames_per_view = None
-    if per_camera:
-        sample_n_views = read_positive_int_metadata(batch, "sample_n_views", expected_count=len(items))
-        frames_per_view = read_positive_int_metadata(
-            batch,
-            "num_video_frames_per_view",
-            expected_count=len(items),
-        )
-        if sample_n_views is None or frames_per_view is None:
-            raise ValueError(
-                "sample_n_views and num_video_frames_per_view are required when per-camera VAE encoding is enabled."
-            )
-
-    latents: list[Any] = []
-    shapes: list[tuple[int, int, int]] = []
-
-    def _encode_clip(video: torch.Tensor) -> torch.Tensor:
-        video_5d = _as_bcthw(video)
-        num_pixel_frames = int(video_5d.shape[2])
-        height = int(video_5d.shape[-2])
-        width = int(video_5d.shape[-1])
-        shapes.append((num_pixel_frames, height, width))
-        if video_5d.dtype == torch.uint8:
-            video_5d = video_5d.to(device=encode_device, dtype=torch.float32) / 127.5 - 1.0
-        else:
-            video_5d = video_5d.to(device=encode_device, dtype=torch.float32)
-        encoded = tokenizer.encode(video_5d)
-        return encoded.contiguous().float()
-
-    encode_cm = encode_stream_ctx(encode_stream) if encode_stream is not None else contextlib.nullcontext()
-    with torch.no_grad(), encode_cm:
-        for sample_idx, item in enumerate(items):
-            clips = _unwrap_vision_sample(item)
-            encoded_clips: list[torch.Tensor] = []
-            n_views = 1 if sample_n_views is None else int(sample_n_views[sample_idx])
-            view_frames = None if frames_per_view is None else int(frames_per_view[sample_idx])
-            for clip in clips:
-                if n_views > 1:
-                    if view_frames is None:
-                        raise ValueError("num_video_frames_per_view is required when sample_n_views > 1")
-                    video_5d = _as_bcthw(clip)
-                    expected = n_views * view_frames
-                    actual = int(video_5d.shape[2])
-                    if actual != expected:
-                        raise ValueError(
-                            "Multiview vision length must equal sample_n_views * num_video_frames_per_view: "
-                            f"got T={actual}, sample_n_views={n_views}, num_video_frames_per_view={view_frames}."
-                        )
-                    view_latents = []
-                    for view_idx in range(n_views):
-                        view_clip = video_5d.narrow(2, view_idx * view_frames, view_frames)
-                        view_latents.append(_encode_clip(view_clip))
-                    encoded_clips.append(torch.cat(view_latents, dim=2))
-                else:
-                    encoded_clips.append(_encode_clip(clip))
-            if isinstance(item, list) and len(item) > 1:
-                latents.append(encoded_clips)
-            else:
-                latents.append(encoded_clips[0])
-    if encode_stream is not None:
-        encode_stream.synchronize()
-    latents = _latents_to_cpu(latents)
-
-    batch[_VISION_LATENT_KEY[media_key]] = latents
-    batch[_VISION_PIXEL_SHAPE_KEY[media_key]] = shapes
     batch["vae_latents_ready"] = True
-    if not keep_video_pixels:
-        del batch[media_key]
+    if "video_pixel_shapes" not in batch:
+        t_s = _as_list(batch.get("video_pixel_t"))
+        h_s = _as_list(batch.get("video_pixel_h"))
+        w_s = _as_list(batch.get("video_pixel_w"))
+        n = len(latents) if isinstance(latents, list) else 1
+        if t_s is not None and h_s is not None and w_s is not None and len(t_s) == n:
+            shapes: list[tuple[int, int, int]] = []
+            ok = True
+            for i in range(n):
+                t_i, h_i, w_i = _scalar_int(t_s[i]), _scalar_int(h_s[i]), _scalar_int(w_s[i])
+                if t_i is None or h_i is None or w_i is None:
+                    ok = False
+                    break
+                shapes.append((t_i, h_i, w_i))
+            if ok:
+                batch["video_pixel_shapes"] = shapes
+    video = batch.get("video")
+    if isinstance(video, list) and video and all(_vision_placeholder(item) for item in video):
+        batch.pop("video", None)
+    images = batch.get("images")
+    if isinstance(images, list) and images and all(_vision_placeholder(item) for item in images):
+        batch.pop("images", None)
     return batch
 
 
@@ -226,6 +111,7 @@ def custom_collate_fn(batch):
         "text_token_ids",
         "images",
         "video",
+        "video_latents",
         "action",
         "action_raw",
         "domain_id",
@@ -234,6 +120,7 @@ def custom_collate_fn(batch):
         "raw_action_dim",
         "image_size",
         "action_processing_record",
+        "vae_cache_miss",
     }
 
     # Data keys where a per-sample value of ``None`` is a meaningful signal
@@ -244,7 +131,17 @@ def custom_collate_fn(batch):
     # model can align per-sample data 1:1 with per-sample plans.  Dropping
     # the entire key on any None would leave the remaining tensors
     # mis-aligned with the plans whose flags were set BEFORE collation.
-    sparse_data_keys = {"sound", "action", "action_raw", "domain_id", "raw_action_dim"}
+    sparse_data_keys = {
+        "sound",
+        "action",
+        "action_raw",
+        "domain_id",
+        "raw_action_dim",
+        "video",
+        "images",
+        "video_latents",
+        "image_latents",
+    }
 
     # Handle the case where the batch is already a dictionary (e.g. column-wise batching)
     if isinstance(batch, dict):
@@ -285,6 +182,17 @@ def custom_collate_fn(batch):
         return result
     else:
         return default_collate(batch)
+
+
+def _sample_flag(sample: dict, key: str) -> bool:
+    value = sample.get(key)
+    if value is None:
+        return False
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return False
+        return bool(value.reshape(-1)[0].item())
+    return bool(value)
 
 
 def sample_has_action(sample: dict) -> bool:
@@ -544,9 +452,7 @@ class JointDataLoader(webdataset.WebLoader):
             # Split the collated batch into individual samples and push them
             # into the buffer — identical to the splitting logic in
             # _get_next_sample — so the samples are not wasted.
-            is_image_batch = "images" in batch
-            input_images_or_videos = batch["images" if is_image_batch else "video"]
-            batch_size = len(input_images_or_videos)
+            batch_size = _collated_batch_size(batch)
 
             for j in range(batch_size):
                 sample = {}
@@ -610,7 +516,7 @@ class JointDataLoader(webdataset.WebLoader):
 
         # Vision part
         is_image_batch = "images" in data_batch
-        input_images_or_videos = data_batch["images" if is_image_batch else "video"]
+        input_images_or_videos = data_batch.get("images" if is_image_batch else "video")
         if "enable_per_camera_vae_encoding" in data_batch:
             sample_n_views_values = read_positive_int_metadata(data_batch, "sample_n_views", expected_count=1)
             frames_per_view_values = read_positive_int_metadata(
@@ -628,22 +534,14 @@ class JointDataLoader(webdataset.WebLoader):
             sample_n_views = None
             frames_per_view = None
 
-        # iterate over all the media in the batch
-        for media in input_images_or_videos if isinstance(input_images_or_videos, list) else [input_images_or_videos]:
-            if is_image_batch:
-                _, H, W = media.shape
-                T = 1
-            else:
-                _, T, H, W = media.shape
-
+        def _vision_tokens_for_thw(T: int, H: int, W: int, *, image: bool) -> int:
             latent_h_shape = H // self.tokenizer_spatial_compression_factor
             latent_w_shape = W // self.tokenizer_spatial_compression_factor
             patch_h_shape = math.ceil(latent_h_shape / self.patch_spatial)
             patch_w_shape = math.ceil(latent_w_shape / self.patch_spatial)
-            if sample_n_views is not None and frames_per_view is not None and not is_image_batch:
-                # The multiview dataset resizes every camera to the same H/W and
-                # selects the same synchronized frame count before concatenating
-                # the camera-major clips along T.
+            if image:
+                latent_t_shape = 1
+            elif sample_n_views is not None and frames_per_view is not None:
                 expected_frames = sample_n_views * frames_per_view
                 if T != expected_frames:
                     raise ValueError(
@@ -653,11 +551,39 @@ class JointDataLoader(webdataset.WebLoader):
                 latent_t_shape = sample_n_views * self._compute_vision_latent_t_shape(frames_per_view, H, W)
             else:
                 latent_t_shape = self._compute_vision_latent_t_shape(T, H, W)
-
-            num_vision_tokens = patch_h_shape * patch_w_shape * latent_t_shape
+            n_vis = patch_h_shape * patch_w_shape * latent_t_shape
             if has_text_tokens:
-                num_vision_tokens += 2
-            num_tokens += num_vision_tokens
+                n_vis += 2
+            return n_vis
+
+        media_list = input_images_or_videos if isinstance(input_images_or_videos, list) else [input_images_or_videos]
+        if not media_list or media_list[0] is None:
+            t_meta = data_batch.get("video_pixel_t")
+            h_meta = data_batch.get("video_pixel_h")
+            w_meta = data_batch.get("video_pixel_w")
+            if isinstance(t_meta, (list, tuple)):
+                t_meta = t_meta[0]
+            if isinstance(h_meta, (list, tuple)):
+                h_meta = h_meta[0]
+            if isinstance(w_meta, (list, tuple)):
+                w_meta = w_meta[0]
+            if isinstance(t_meta, torch.Tensor):
+                t_meta = int(t_meta.reshape(-1)[0].item())
+            if isinstance(h_meta, torch.Tensor):
+                h_meta = int(h_meta.reshape(-1)[0].item())
+            if isinstance(w_meta, torch.Tensor):
+                w_meta = int(w_meta.reshape(-1)[0].item())
+            if t_meta is None or h_meta is None or w_meta is None:
+                raise ValueError("video is missing and video_pixel_t/h/w are required for token packing")
+            num_tokens += _vision_tokens_for_thw(int(t_meta), int(h_meta), int(w_meta), image=False)
+        else:
+            for media in media_list:
+                if is_image_batch:
+                    _, H, W = media.shape
+                    T = 1
+                else:
+                    _, T, H, W = media.shape
+                num_tokens += _vision_tokens_for_thw(T, H, W, image=is_image_batch)
 
         # Action part: each action time step is 1 token.
         # Action tensor shape is (T_action, D) per sample; stored as a single-element list.
@@ -710,7 +636,16 @@ class JointDataLoader(webdataset.WebLoader):
     # Keys where each sample may hold multiple tensors (e.g. multiple video
     # clips in a packed sequence).  Kept as single-element lists per sample
     # via v[i:i+1] so that _update_output_batch yields list[list[Tensor]].
-    _MULTI_ITEM_KEYS = {"text_token_ids", "images", "video", "action", "action_raw", "sound"}
+    _MULTI_ITEM_KEYS = {
+        "text_token_ids",
+        "images",
+        "video",
+        "video_latents",
+        "image_latents",
+        "action",
+        "action_raw",
+        "sound",
+    }
 
     def _get_next_sample(self, index_id: int) -> dict:
         """Pop the next single-sample dict from the buffer for the given dataloader.
@@ -758,9 +693,7 @@ class JointDataLoader(webdataset.WebLoader):
                 self.dataloaders[index_id] = iter(self.dataloader_list[index_id])
                 batch = next(self.dataloaders[index_id])
 
-            is_image_batch = "images" in batch
-            input_images_or_videos = batch["images" if is_image_batch else "video"]
-            batch_size = len(input_images_or_videos)
+            batch_size = _collated_batch_size(batch)
 
             for i in range(batch_size):
                 sample = {}
@@ -1099,9 +1032,6 @@ class PackingDataLoader(JointDataLoader):
         uniae_pad_frames: int | None = None,
         recycle_inner_iterator: bool = False,
         prewarm: bool = True,
-        encode_vision_latents: bool = False,
-        encoded_prefetch_depth: int = 0,
-        keep_video_pixels: bool = False,
     ):
         """
         Args:
@@ -1119,12 +1049,6 @@ class PackingDataLoader(JointDataLoader):
             lookahead_limit: Packing-loop look-ahead for the wrapped dataloader.
             uniae_chunk_frames: Optional UniAE full chunk size, or resolution-keyed chunk sizes.
             uniae_pad_frames: Optional UniAE boundary padding frames per chunk.
-            encode_vision_latents: When True, VAE-encode packed videos before yield. Requires
-                :meth:`attach_vision_tokenizer` after the model tokenizer is constructed.
-            encoded_prefetch_depth: Encoded-batch queue depth. 0 = encode in ``next()``.
-                ``>=1`` fills that many batches before the first yield and keeps the queue
-                full on a producer thread so training can overlap the next encode.
-            keep_video_pixels: Keep uint8 ``video``/``images`` after encode (viz only).
         """
         wrapped = {dataset_name: {"dataloader": dataloader, "ratio": 1}}
         super().__init__(
@@ -1141,39 +1065,6 @@ class PackingDataLoader(JointDataLoader):
             uniae_pad_frames=uniae_pad_frames,
             recycle_inner_iterator=recycle_inner_iterator,
             prewarm=prewarm,
-        )
-        if encoded_prefetch_depth < 0:
-            raise ValueError(f"encoded_prefetch_depth must be >= 0, got {encoded_prefetch_depth}")
-        self.encode_vision_latents = bool(encode_vision_latents)
-        self.encoded_prefetch_depth = int(encoded_prefetch_depth) if self.encode_vision_latents else 0
-        self.keep_video_pixels = bool(keep_video_pixels)
-        self._vision_tokenizer: Any = None
-        self._vision_tokenizer_device: torch.device | None = None
-
-    def attach_vision_tokenizer(self, tokenizer: Any) -> None:
-        """Bind the model's frozen vision tokenizer for packed-batch encode."""
-        if tokenizer is None:
-            raise RuntimeError("attach_vision_tokenizer received tokenizer=None")
-        self._vision_tokenizer = tokenizer
-        self._vision_tokenizer_device = _infer_tokenizer_device(tokenizer)
-        log.info(
-            "PackingDataLoader: attached vision tokenizer "
-            f"{type(tokenizer).__name__} on {self._vision_tokenizer_device} "
-            f"(prefetch_depth={self.encoded_prefetch_depth}, keep_pixels={self.keep_video_pixels})",
-            rank0_only=False,
-        )
-
-    def _encode_packed_batch(self, batch: dict) -> dict:
-        if self._vision_tokenizer is None:
-            raise RuntimeError(
-                "PackingDataLoader.encode_vision_latents=True requires attach_vision_tokenizer "
-                "before iteration (trainer.train attaches model.tokenizer_vision_gen)."
-            )
-        return encode_packed_vision_batch(
-            batch,
-            self._vision_tokenizer,
-            keep_video_pixels=self.keep_video_pixels,
-            device=self._vision_tokenizer_device,
         )
 
     def _iter_packed(self) -> Iterator[dict]:
@@ -1192,6 +1083,7 @@ class PackingDataLoader(JointDataLoader):
             # Teacher-forcing expansion requires a homogeneous V+A or V-only
             # pack. Keep the first sample's action layout and skip mismatches.
             pack_has_action: bool | None = None
+            cache_miss_streak = 0
 
             while True:
                 if self.max_samples_per_batch is not None and num_samples >= self.max_samples_per_batch:
@@ -1204,6 +1096,18 @@ class PackingDataLoader(JointDataLoader):
                     output = self._get_next_sample(0)
                 except StopIteration:
                     break
+
+                if _sample_flag(output, "vae_cache_miss"):
+                    cache_miss_streak += 1
+                    log.warning(
+                        "VAE latent cache miss; skipping sample "
+                        f"episode_index={output.get('episode_index')}",
+                        rank0_only=False,
+                    )
+                    if cache_miss_streak >= 1024:
+                        raise RuntimeError("VAE latent cache: 1024 consecutive misses")
+                    continue
+                cache_miss_streak = 0
 
                 sample_action = sample_has_action(output)
                 if pack_has_action is None:
@@ -1245,48 +1149,10 @@ class PackingDataLoader(JointDataLoader):
                 return
 
             self.global_id += 1
-            yield output_batch
-
-    def _iter_encoded_prefetch(self, packed_iter: Iterator[dict]) -> Iterator[dict]:
-        encoded_queue: queue.Queue = queue.Queue(maxsize=self.encoded_prefetch_depth)
-        stop = threading.Event()
-
-        def _producer() -> None:
-            try:
-                device = self._vision_tokenizer_device or _infer_tokenizer_device(self._vision_tokenizer)
-                self._vision_tokenizer_device = device
-                _set_current_torch_device(device)
-                for packed in packed_iter:
-                    if stop.is_set():
-                        break
-                    encoded_queue.put(self._encode_packed_batch(packed))
-                encoded_queue.put(_ENCODED_QUEUE_SENTINEL)
-            except Exception as exc:  # noqa: BLE001 — surface any producer failure to next()
-                encoded_queue.put(exc)
-
-        producer = threading.Thread(target=_producer, name="packing-vae-encode", daemon=True)
-        producer.start()
-        try:
-            while True:
-                item = encoded_queue.get()
-                if item is _ENCODED_QUEUE_SENTINEL:
-                    return
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-        finally:
-            stop.set()
+            yield _finalize_packed_vision_latents(output_batch)
 
     def __iter__(self):
-        packed_iter = self._iter_packed()
-        if not self.encode_vision_latents:
-            yield from packed_iter
-            return
-        if self.encoded_prefetch_depth <= 0:
-            for packed in packed_iter:
-                yield self._encode_packed_batch(packed)
-            return
-        yield from self._iter_encoded_prefetch(packed_iter)
+        yield from self._iter_packed()
 
 
 class RandomJointDataLoader(JointDataLoader):

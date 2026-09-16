@@ -212,15 +212,6 @@ class ImaginaireTrainer:
         model = model.to("cuda", memory_format=self.config.trainer.memory_format)  # type: ignore
         model.on_train_start(self.config.trainer.memory_format)
 
-        if getattr(dataloader_train, "encode_vision_latents", False):
-            attach = getattr(dataloader_train, "attach_vision_tokenizer", None)
-            if not callable(attach):
-                raise RuntimeError(
-                    "dataloader_train.encode_vision_latents is True, but the dataloader "
-                    "has no attach_vision_tokenizer (expected PackingDataLoader)."
-                )
-            attach(getattr(model, "tokenizer_vision_gen", None))
-
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()
         optimizer, scheduler = model.init_optimizer_scheduler(self.config.optimizer, self.config.scheduler)

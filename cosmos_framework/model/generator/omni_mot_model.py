@@ -3566,9 +3566,9 @@ class OmniMoTModel(ImaginaireModel):
         # Detect whether any sample has multiple vision items (e.g. image editing).
         # If so, track the count per sample before all vision items from this batch are flattened into a list.
         is_image_batch = self.is_image_batch(data_batch)
-        precomputed_latents = bool(data_batch.get("vae_latents_ready"))
         latent_key = "image_latents" if is_image_batch else "video_latents"
         media_key = self.input_image_key if is_image_batch else self.input_video_key
+        precomputed_latents = bool(data_batch.get("vae_latents_ready")) or latent_key in data_batch
         sample_vision_list = data_batch[latent_key if precomputed_latents else media_key]
 
         # we should always get this information here during training. If we can read this field

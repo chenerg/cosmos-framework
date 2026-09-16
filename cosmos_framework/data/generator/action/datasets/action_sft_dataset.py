@@ -73,6 +73,8 @@ class ActionSFTDataset(Dataset):
         self._dataset = dataset
         self._transform = transform
         self._resolution = resolution
+        if resolution is not None:
+            setattr(dataset, "_vae_cache_resolution", str(resolution))
 
     def __len__(self) -> int:
         return len(self._dataset)

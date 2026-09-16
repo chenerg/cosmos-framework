@@ -125,17 +125,17 @@ Packing-time discard (`Discarding oversized sample` in the log) still **decodes*
 
 DROID concat 480p (`K=391` vis tokens / latent, packing `extra=500`): `max_pre_tf_tokens=48000` → **477 frames**. 8-card Edge selective AC: 120 blocks (~481 frames / ~9.6e4 post-TF packed) trains; 128 blocks / unbounded long episodes OOM. Sweep numbers: [`docs/max_episode_blocks_npu0_3_dp2_dp4_iter_time.md`](../../../docs/max_episode_blocks_npu0_3_dp2_dp4_iter_time.md).
 
-Whole-episode host-RAM extras (recipe Python / Hydra tail, not TOML schema): `dataloader_train.lookahead_limit` (Edge recipe `1`; default `10` caches extra decoded videos) and `dataloader_train.dataloader.prefetch_factor` (`2` is the 256p Edge default — RSS is OK; 480p used to be huge, so fall back to `1` if RSS is tight). `num_workers=4` is the 8-card 480p floor that stops data-wait; `ActionIterableShuffleDataset` wraps when `ranks × workers >` episode count.
+Whole-episode host-RAM extras (recipe Python / Hydra tail, not TOML schema): `dataloader_train.lookahead_limit` (Edge recipe `1`; default `10` caches extra decoded videos). Edge TF: `num_workers=8`；`prefetch_factor=2` at 256p（no-pack 23.3 s）；**480p use `prefetch_factor=1`**（no-pack pf=2 was 32.21 vs 31.67, RSS +81 GiB）. `ActionIterableShuffleDataset` wraps when `ranks × workers >` episode count.
 
-VAE pre-encode on `PackingDataLoader` is **on** for DROID Edge (`action_policy_droid_edge`: `encode_vision_latents=true`, `encoded_prefetch_depth=1`). After packing, the rank process encodes uint8 video with the model's frozen `tokenizer_vision_gen` on **the same** `npu:LOCAL_RANK` (a side `torch.npu.Stream`, not an extra card) and yields `video_latents` so `get_data_and_condition` skips encode. Trainer calls `attach_vision_tokenizer` after `model.on_train_start`. Other recipes still default off (class ctor `false` / `0`). Campaign + 8-card 28.17 s final: [`experiments/20260911_droid_edge_tf_opt_campaign.md`](../../../experiments/20260911_droid_edge_tf_opt_campaign.md).
+`PackingDataLoader` does **not** run Wan VAE. Default: dataset yields uint8 `video`, `get_data_and_condition` encodes on the training stream. To skip encode at train time, precompute latents offline and point the dataset at them:
 
-| Knob | DROID Edge | Meaning |
-| --- | --- | --- |
-| `dataloader_train.encode_vision_latents` | `true` | Encode packed videos before yield; drop pixels unless `keep_video_pixels` |
-| `dataloader_train.encoded_prefetch_depth` | `1` | `0` = encode in `next()`. `>=1` pre-fills that many encoded batches on a producer thread so training can overlap the next encode |
-| `dataloader_train.keep_video_pixels` | `false` | Keep uint8 `video` after encode (viz only) |
+```bash
+export COSMOS_VAE_LATENT_CACHE=/data5T/chenzhi/vae_latent_cache_droid_edge_256
+```
 
-Do **not** construct a second VAE or steal a spare NPU for encode. Turn off: `EXTRA_TAIL_OVERRIDES="dataloader_train.encode_vision_latents=false"`. On 64 GiB 910B3, `encoded_prefetch_depth=1` can OOM if next-batch pixels overlap backward; fall back to `0` (4-card 44.6 s vs 32.5 s — overlap still wins). Sync encode (`depth=0`) does not hide wall time. 8-card final with pack + prefetch=2 + sidestream: [`experiments/20260911_154447_8npu_droid_tf_final_pf2_stream_21step`](../../../experiments/20260911_154447_8npu_droid_tf_final_pf2_stream_21step/) avg_skip1 **28.17 s**.
+Workers `torch.load` the `.pt` files and yield `video_latents` (no AV1 decode). Cache misses are skipped in packing, not encoded. Do not add a dataloader-side `tokenizer.encode` path.
+
+**256p long-T OOM is in-step VAE, not TND.** Same pre-TF token budget: 256p (K=80) is ~4.7× more RGB frames than 480p (K=391). Wan VAE / CANN 3D-conv workspace scales with **T**. 4-card TF `history=32`: 256p TND max-ok **T=2233 / 47452 tok**; **T=2257 / 47956 OOM step 1** (PyTorch reserved ~38 GiB, `npu-smi` 64 GiB). 480p TND at 47896 tok (T=477) is fine. Details: [`experiments/20260914_4npu_max_tokens_oom.md`](../../../experiments/20260914_4npu_max_tokens_oom.md).
 
 ### Causal teacher forcing
 

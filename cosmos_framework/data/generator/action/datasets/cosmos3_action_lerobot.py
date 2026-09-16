@@ -13,6 +13,7 @@ These helpers centralize common behavior across Action wrappers:
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib
 import logging as _logging
 import math
@@ -35,6 +36,16 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from torch.utils.data import Dataset
 
 _hf_offline_applied = False
+
+
+def episode_vae_cache_key(episode_index: int, resolution: str, t: int, h: int, w: int) -> str:
+    """On-disk key for a precomputed Wan VAE latent of one resized episode."""
+    raw = f"v2|episode_index={int(episode_index)}|res={resolution}|T={int(t)}|{int(h)}x{int(w)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def episode_vae_cache_path(cache_dir: Path, key: str) -> Path:
+    return Path(cache_dir) / key[:2] / f"{key}.pt"
 
 
 def _ensure_hf_hub_offline() -> None:
@@ -1135,6 +1146,51 @@ class BaseActionLeRobotDataset(Dataset):
         )
         return stride
 
+    def _vae_cache_target_hw(self) -> tuple[int, int]:
+        """Post-resize (H, W) used as VAE cache key, matching ActionTransformPipeline."""
+        from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
+
+        res = str(getattr(self, "_vae_cache_resolution", "") or "")
+        if not res or res not in VIDEO_RES_SIZE_INFO:
+            raise RuntimeError(f"{self.__class__.__name__}: VAE cache resolution {res!r} is not in VIDEO_RES_SIZE_INFO")
+        aspect = "4,3" if getattr(self, "_viewpoint", None) == "concat_view" else "16,9"
+        w, h = VIDEO_RES_SIZE_INFO[res][aspect]
+        return int(h), int(w)
+
+    def _vae_skip_video_enabled(self) -> bool:
+        """Load precomputed Wan latents from ``COSMOS_VAE_LATENT_CACHE`` instead of decoding video."""
+        cache_raw = _os.environ.get("COSMOS_VAE_LATENT_CACHE", "").strip()
+        if not cache_raw:
+            return False
+        raw = _os.environ.get("COSMOS_VAE_SKIP_VIDEO", "1").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _load_episode_vae_latent(self, episode_id: int, target_t: int) -> torch.Tensor | None:
+        cache_raw = _os.environ.get("COSMOS_VAE_LATENT_CACHE", "").strip()
+        res = str(getattr(self, "_vae_cache_resolution", "") or "")
+        if not cache_raw or not res:
+            return None
+        try:
+            h, w = self._vae_cache_target_hw()
+        except RuntimeError:
+            return None
+        key = episode_vae_cache_key(episode_id, res, target_t, h, w)
+        path = episode_vae_cache_path(cache_raw, key)
+        if not path.is_file():
+            return None
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        latent = payload.get("latent")
+        if not isinstance(latent, torch.Tensor):
+            return None
+        if latent.dtype != torch.bfloat16:
+            latent = latent.to(dtype=torch.bfloat16)
+        return latent.contiguous()
+
     def _padded_whole_episode_frames(self, n_native: int, native_fps: float) -> int:
         """``4N+1`` padded frame count that whole-episode fetch would produce.
 
@@ -1350,7 +1406,23 @@ class BaseActionLeRobotDataset(Dataset):
         task_index = int(sample.pop("task_index")[0].item())
         sample["task"] = ds.meta.tasks.iloc[task_index].name
 
-        if not self._skip_video_loading:
+        if self._vae_skip_video_enabled():
+            h, w = self._vae_cache_target_hw()
+            sample["_skip_video_decode"] = True
+            sample["_video_pixel_t"] = int(target_t)
+            sample["_video_pixel_h"] = int(h)
+            sample["_video_pixel_w"] = int(w)
+            latent = self._load_episode_vae_latent(int(episode_id), int(target_t))
+            if latent is not None:
+                sample["_video_latents"] = latent
+            else:
+                sample["_vae_cache_miss"] = True
+                log.warning(
+                    f"{self.__class__.__name__}: VAE latent cache miss; skipping video "
+                    f"episode_index={int(episode_id)} T={int(target_t)} {int(h)}x{int(w)}",
+                    rank0_only=False,
+                )
+        elif not self._skip_video_loading:
             camera_keys = self._whole_episode_camera_features()
             if camera_keys:
                 stride = self._whole_episode_stride(ds)

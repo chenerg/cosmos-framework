@@ -211,21 +211,15 @@ action_policy_droid_edge = LazyDict(
             sound_latent_fps=0,
             tokenizer_spatial_compression_factor=16,
             tokenizer_temporal_compression_factor=4,
-            # Encode packed uint8 video in PackingDataLoader (same frozen
-            # tokenizer_vision_gen). Training consumes video_latents.
-            # prefetch_depth=1 overlaps the next encode with the current step.
-            # OOM on 64 GiB: encoded_prefetch_depth=0. Off:
-            # encode_vision_latents=false.
-            encode_vision_latents=True,
-            encoded_prefetch_depth=1,
-            keep_video_pixels=False,
             dataloader=L(RankPartitionedDataLoader)(
                 batch_size=1,
                 in_order=False,
-                num_workers=4,
+                # 8-card TF: nw=8 hides AV1 (256p no-pack 23.3s vs nw=4 35.2s).
+                # nw=16 was −2% with ~900 GiB RSS, drop.
+                num_workers=8,
                 persistent_workers=True,
                 pin_memory=True,
-                prefetch_factor=2,  # 256p RSS is OK; 480p used to be huge (~TiB host RSS)
+                prefetch_factor=2,  # 256p no-pack default. 480p: pf=1 (pf=2 was 32.21 vs 31.67, RSS +81 GiB).
                 sampler=None,
                 # Shuffling is handled by the dataset (iterable_shuffle=True below):
                 # ActionIterableShuffleDataset streams rank x worker-sharded, episode-order-

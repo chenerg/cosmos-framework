@@ -524,7 +524,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         else:
             ai_caption = sample["task"]
 
-        if self._skip_video_loading:
+        if self._skip_video_loading or sample.get("_skip_video_decode"):
             video = None
         elif self._video_mode is None:
             if self._viewpoint == "concat_view":
@@ -558,6 +558,20 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
                 video = torch.cat([wrist, torch.cat([left, right], dim=-1)], dim=-2)
 
         extras: dict[str, Any] = {}
+        _, _, episode_id, _ = self._resolve_index(int(idx))
+        extras["episode_index"] = int(episode_id)
+        res = getattr(self, "_vae_cache_resolution", None)
+        if res is not None:
+            extras["vae_cache_resolution"] = str(res)
+        if sample.get("_skip_video_decode"):
+            extras["video_pixel_t"] = int(sample["_video_pixel_t"])
+            extras["video_pixel_h"] = int(sample["_video_pixel_h"])
+            extras["video_pixel_w"] = int(sample["_video_pixel_w"])
+            if sample.get("_video_latents") is not None:
+                extras["video_latents"] = sample["_video_latents"]
+                extras["vae_latents_ready"] = True
+            if sample.get("_vae_cache_miss"):
+                extras["vae_cache_miss"] = True
 
         if self._action_space == "midtrain":
             pose_convention = cast(PoseConvention, self._pose_convention)

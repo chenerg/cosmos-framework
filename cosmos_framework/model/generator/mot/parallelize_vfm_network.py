@@ -135,7 +135,7 @@ def parallelize_vfm_network(
     if compile_config.enabled and compile_config.compiled_region == "all":
         model = apply_compile(model, compile_config)
 
-    if parallel_dims is not None and parallel_dims.dp_enabled:
+    if parallel_dims is not None and parallel_dims.dp_shard_enabled:
         # Collect parameters to ignore during FSDP wrapping
         ignored_params = set()
 

@@ -219,7 +219,7 @@ class OmniMoTModel(ImaginaireModel):
         dtype = resolve_vfm_parameter_storage_dtype(
             dtype,
             self.config.parallelism,
-            fsdp_enabled=self.parallel_dims is not None and self.parallel_dims.dp_enabled,
+            fsdp_enabled=self.parallel_dims is not None and self.parallel_dims.dp_shard_enabled,
         )
         lora_enabled = self.config.lora_enabled if lora_enabled is None else lora_enabled
         with torch.device("meta"):

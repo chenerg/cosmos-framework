@@ -52,7 +52,9 @@ def test_vfm_fsdp_mixed_precision_uses_bf16_compute_and_fp32_storage() -> None:
 def test_parallelize_vfm_preserves_root_inputs_and_casts_nested_block_inputs() -> None:
     config = ParallelismConfig(fsdp_mixed_precision_enabled=True, fsdp_master_dtype="float32")
     model = SimpleNamespace(language_model=object())
-    parallel_dims = SimpleNamespace(cp_enabled=False, dp_enabled=True, dp_mesh=object())
+    parallel_dims = SimpleNamespace(
+        cp_enabled=False, dp_enabled=True, dp_shard_enabled=True, dp_mesh=object()
+    )
     compile_config = SimpleNamespace(enabled=False, compiled_region="language")
 
     with (

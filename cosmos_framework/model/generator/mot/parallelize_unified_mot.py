@@ -467,6 +467,6 @@ def parallelize_unified_mot(
     apply_ac(model, ac_config)
     if compile_config.enabled:
         apply_compile(model, compile_config)
-    if parallel_dims is not None and parallel_dims.dp_enabled:
+    if parallel_dims is not None and parallel_dims.dp_shard_enabled:
         apply_fsdp(model, parallel_dims, mp_policy=fsdp_mixed_precision_policy)
     return model

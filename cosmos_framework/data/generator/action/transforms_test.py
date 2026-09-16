@@ -141,12 +141,14 @@ def test_action_prompt_json_formatter_omits_clip_timeline_for_policy() -> None:
         "image_size": torch.tensor([544, 736, 540, 640]),
         "viewpoint": "concat_view",
         "mode": "policy",
+        "idle_frames": torch.tensor(4),
     }
 
     prompt = formatter(data_dict)["ai_caption"]
 
     assert "duration" not in prompt
     assert "time" not in prompt["actions"][0]
+    assert "idle_frame" not in prompt["actions"][0]
     assert prompt["actions"][0]["description"] == "Pick up the cup."
     assert prompt["fps"] == 15.0
     assert prompt["resolution"] == {"H": 544, "W": 736}
@@ -176,19 +178,19 @@ def test_action_transform_pipeline_json_prompt_toggle() -> None:
 
     prompt = result["ai_caption"]
     assert isinstance(prompt, dict)
-    # Policy UND must not leak clip length (duration / action time range).
+    # Policy UND must not leak clip length (duration / action time / idle count).
     assert list(prompt.keys()) == ["cinematography", "actions", "fps", "resolution", "aspect_ratio"]
-    assert list(prompt["actions"][0].keys()) == ["description", "idle_frame"]
+    assert list(prompt["actions"][0].keys()) == ["description"]
     assert prompt["cinematography"] == {
         "framing": "This video is captured from a third-person perspective looking towards the agent from the front."
     }
     assert prompt["actions"] == [
         {
             "description": "Open the drawer.",
-            "idle_frame": "3 out of 16.",
         }
     ]
     assert "duration" not in prompt
+    assert "idle_frame" not in prompt["actions"][0]
     assert prompt["fps"] == 8.0
     assert prompt["resolution"] == {"H": 192, "W": 320}
     assert prompt["aspect_ratio"] == "16,9"
@@ -222,10 +224,10 @@ def test_action_transform_pipeline_keeps_ai_caption_string_path() -> None:
     assert result["ai_caption"] == (
         "Open the drawer. "
         "This video is captured from a third-person perspective looking towards the agent from the front. "
-        "The video is 2.0 seconds long and is of 8 FPS. "
-        "This video is of 256x256 resolution. "
-        "IdleFrames: 3 out of 16."
+        "This video is of 256x256 resolution."
     )
+    assert "seconds long" not in result["ai_caption"]
+    assert "IdleFrames" not in result["ai_caption"]
     assert result["action"].shape == (16, 4)
 
 
@@ -283,6 +285,7 @@ def test_action_transform_pipeline_keeps_idle_frames_for_forward_dynamics() -> N
     result = pipeline(data_dict, resolution="256")
 
     assert "IdleFrames: 3 out of 16." in result["ai_caption"]
+    assert "seconds long" in result["ai_caption"]
     assert result["action"].shape == (16, 4)
 
 

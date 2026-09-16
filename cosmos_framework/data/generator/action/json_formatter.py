@@ -13,8 +13,13 @@ from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 
 
 def _should_append_idle_frame_info(mode: object) -> bool:
-    """Return whether idle-frame prompt metadata should be surfaced."""
-    return mode != "inverse_dynamics"
+    """Return whether idle-frame prompt metadata should be surfaced.
+
+    ``idle_frame`` counts still frames and the ``out of T`` total, which leaks
+    the clip horizon. Omit it for ``policy`` (causal teacher-forcing) and
+    ``inverse_dynamics`` (idle text is not part of that task).
+    """
+    return mode not in ("policy", "inverse_dynamics")
 
 
 def _include_clip_timeline(mode: object) -> bool:
@@ -35,9 +40,9 @@ class ActionPromptJsonFormatter:
     Like video JSON prompts, ``cinematography`` is a dictionary, duration is
     truncated to an integer-second string such as ``"2s"``, and aspect ratio is
     stored as a comma-separated string such as ``"16,9"``. If
-    ``data_dict["mode"]`` is ``"inverse_dynamics"``, idle-frame metadata is
-    omitted. If it is ``"policy"``, ``duration`` and ``actions[].time`` are
-    omitted so UND text does not leak the clip horizon.
+    ``data_dict["mode"]`` is ``"policy"``, ``duration``, ``actions[].time``, and
+    ``idle_frame`` are omitted so UND text does not leak the clip horizon.
+    ``inverse_dynamics`` also omits idle-frame metadata.
     """
 
     def __init__(

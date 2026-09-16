@@ -26,7 +26,11 @@ from cosmos_framework.data.generator.action.action_processing import (
     ActionNormalizer,
     ActionProcessor,
 )
-from cosmos_framework.data.generator.action.json_formatter import ActionPromptJsonFormatter
+from cosmos_framework.data.generator.action.json_formatter import (
+    ActionPromptJsonFormatter,
+    _include_clip_timeline,
+    _should_append_idle_frame_info,
+)
 from cosmos_framework.data.generator.action.viewpoint_utils import ViewpointTextInfo
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.idle_frames_text_info import IdleFramesTextInfo
@@ -35,11 +39,6 @@ from cosmos_framework.data.generator.augmentors.text_tokenizer import TextTokeni
 from cosmos_framework.data.generator.utils import VIDEO_RES_SIZE_INFO
 from cosmos_framework.data.generator.sequence_packing import SequencePlan
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution
-
-
-def _should_append_idle_frame_info(mode: object) -> bool:
-    """Return whether idle-frame prompt metadata should be surfaced."""
-    return mode != "inverse_dynamics"
 
 
 _FORCE_FRAMES_LOGGED = False
@@ -528,6 +527,7 @@ class ActionTransformPipeline:
             samples contain a ``"viewpoint"`` key.  Defaults to ``True``.
         append_duration_fps_timestamps: Whether to append duration and FPS metadata to the
             caption (matching VFM's ``DurationFPSTextTimeStamps`` augmentor).
+            Skipped for ``"policy"`` so captions do not leak clip duration.
             Defaults to ``True``.
         append_resolution_info: Whether to append resolution metadata to the
             caption (matching VFM's ``ResolutionTextInfo`` augmentor).
@@ -536,9 +536,9 @@ class ActionTransformPipeline:
             total action frames to the caption (Pi0.7-style metadata, via
             ``IdleFramesTextInfo`` augmentor).  The dataset is responsible for
             populating ``data_dict["idle_frames"]``; samples without it are
-            silently skipped.  Idle-frame text is skipped only for
-            ``"inverse_dynamics"`` mode.  Defaults to ``False`` so existing
-            experiments are unaffected.
+            silently skipped.  Idle-frame text is skipped for ``"policy"`` and
+            ``"inverse_dynamics"`` so captions do not leak clip horizon.
+            Defaults to ``False`` so existing experiments are unaffected.
         idle_frames_dropout: Per-field dropout rate for the idle-frame segment.
             With this probability the augmentor leaves the caption unchanged
             (matching Pi0.7's ~5% per-component dropout).  Independent of the
@@ -665,10 +665,11 @@ class ActionTransformPipeline:
            predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
         2. Format the caption as a structured JSON prompt (if enabled).
         3. Otherwise, append viewpoint type metadata to caption (if enabled).
-        4. Append duration/FPS metadata to caption (if enabled).
+        4. Append duration/FPS metadata to caption unless the sample is in
+           policy mode (if enabled).
         5. Append resolution metadata to caption (if enabled).
         6. Append idle-frame metadata (Pi0.7-style) to caption unless the
-           sample is in inverse dynamics mode (if enabled).
+           sample is in policy or inverse-dynamics mode (if enabled).
         7. Tokenize caption text (if enabled).
         8. Build a ``SequencePlan`` from the ``"mode"`` key (if present).
         9. If action is needed by the plan, preserve the canonical unnormalized
@@ -709,7 +710,8 @@ class ActionTransformPipeline:
                     data_dict = result
 
             # 4. Append duration/FPS metadata to caption (if enabled).
-            if self.duration_fps_augmentor is not None:
+            # Policy omits clip duration so UND text does not leak the horizon.
+            if self.duration_fps_augmentor is not None and _include_clip_timeline(mode):
                 result = self.duration_fps_augmentor(data_dict)
                 if result is not None:
                     data_dict = result

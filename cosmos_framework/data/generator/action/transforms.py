@@ -16,6 +16,8 @@ for the map-to-iterable wrapper.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torchvision.transforms.functional as transforms_F
 
@@ -38,6 +40,51 @@ from cosmos_framework.utils.generator.data_utils import get_vision_data_resoluti
 def _should_append_idle_frame_info(mode: object) -> bool:
     """Return whether idle-frame prompt metadata should be surfaced."""
     return mode != "inverse_dynamics"
+
+
+_FORCE_FRAMES_LOGGED = False
+
+
+def _maybe_force_video_frames(data_dict: dict) -> dict:
+    """Pad or truncate video/action T to ``COSMOS_FORCE_VIDEO_FRAMES``.
+
+    Used by the max-token HBM probe so every sample is exactly ``F_max``
+    (4N+1) after spatial resize. Unset env → no-op.
+    """
+    raw = os.environ.get("COSMOS_FORCE_VIDEO_FRAMES", "").strip()
+    if not raw:
+        return data_dict
+    t_tgt = int(raw)
+    if t_tgt < 1:
+        return data_dict
+    global _FORCE_FRAMES_LOGGED
+    video = data_dict.get("video")
+    action = data_dict.get("action")
+    t_vid = int(video.shape[1]) if isinstance(video, torch.Tensor) and video.ndim == 4 else None
+    t_act = int(action.shape[0]) if isinstance(action, torch.Tensor) and action.ndim >= 1 else None
+    if isinstance(video, torch.Tensor) and video.ndim == 4:
+        t = int(video.shape[1])
+        if t < t_tgt:
+            pad = video[:, -1:].expand(video.shape[0], t_tgt - t, video.shape[2], video.shape[3])
+            data_dict["video"] = torch.cat([video, pad], dim=1)
+        elif t > t_tgt:
+            data_dict["video"] = video[:, :t_tgt].contiguous()
+    if isinstance(action, torch.Tensor) and action.ndim >= 1:
+        t = int(action.shape[0])
+        if t < t_tgt:
+            pad = action[-1:].expand(t_tgt - t, *action.shape[1:])
+            data_dict["action"] = torch.cat([action, pad], dim=0)
+        elif t > t_tgt:
+            data_dict["action"] = action[:t_tgt].contiguous()
+    if not _FORCE_FRAMES_LOGGED:
+        log.info(
+            f"COSMOS_FORCE_VIDEO_FRAMES={t_tgt}: video T {t_vid} -> "
+            f"{data_dict['video'].shape[1] if isinstance(data_dict.get('video'), torch.Tensor) else None} "
+            f"action T {t_act} -> "
+            f"{data_dict['action'].shape[0] if isinstance(data_dict.get('action'), torch.Tensor) else None}"
+        )
+        _FORCE_FRAMES_LOGGED = True
+    return data_dict
 
 
 def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
@@ -402,6 +449,13 @@ class VideoResize:
             ``"image_size"`` entry.
         """
         video = data_dict.get("video")
+        if video is None:
+            h = int(data_dict.get("video_pixel_h") or 0)
+            w = int(data_dict.get("video_pixel_w") or 0)
+            if h <= 0 or w <= 0:
+                raise AssertionError("video is required for reflection padding (or video_pixel_h/w)")
+            data_dict["image_size"] = torch.tensor([h, w, h, w], dtype=torch.float)
+            return data_dict
         assert isinstance(video, torch.Tensor), "video is required for reflection padding"
         h, w = video.shape[-2:]
 
@@ -642,6 +696,7 @@ class ActionTransformPipeline:
 
         # 1. Resize + reflection-pad spatial dimensions to the closest predefined target from ``VIDEO_RES_SIZE_INFO[resolution]``.
         data_dict = self.video_resize(data_dict, resolution)
+        data_dict = _maybe_force_video_frames(data_dict)
 
         # 2. Format the caption as structured JSON when requested; otherwise run the legacy string appenders.
         if self.prompt_json_formatter is not None:
@@ -678,8 +733,12 @@ class ActionTransformPipeline:
         # 8. Build a ``SequencePlan`` from the ``"mode"`` key (if present).
         video = data_dict.get("video")
         action = data_dict.get("action")
-        assert video is not None, "video is required"
-        video_length = video.shape[1]  # [C,T,H,W] -> T
+        if video is None:
+            t_meta = data_dict.get("video_pixel_t")
+            assert t_meta is not None, "video is required (or video_pixel_t when skipping decode)"
+            video_length = int(t_meta.item() if isinstance(t_meta, torch.Tensor) else t_meta)
+        else:
+            video_length = video.shape[1]  # [C,T,H,W] -> T
         action_length = action.shape[0] if isinstance(action, torch.Tensor) else max(video_length - 1, 0)
 
         # Prepend history action frames (ground-truth conditioning) if present.

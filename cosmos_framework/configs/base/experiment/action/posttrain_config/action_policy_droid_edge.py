@@ -250,9 +250,10 @@ action_policy_droid_edge = LazyDict(
                             action_normalization=None,
                             viewpoint="concat_view",  # wrist (top) + L/R shoulder 1/2 (bottom) → 256p 4:3
                             resolution="256",  # 640x360 data @ 256p (320x256)
-                            # Close torchcodec/FFmpeg after each episode. Packed-mp4 AV1
+                            # Close the decoder after each episode. Packed-mp4 AV1
                             # decoder state is large; a 64-slot LRU does not help unique
                             # whole-episode streams and dominates host RSS.
+                            # video_backend defaults to pyav (DROIDLeRobotDataset).
                             video_decoder_cache_size=0,
                             max_action_dim="${model.config.max_action_dim}",
                             cfg_dropout_rate=0.1,

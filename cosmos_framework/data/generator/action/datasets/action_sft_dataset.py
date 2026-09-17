@@ -206,7 +206,7 @@ def get_action_droid_sft_dataset(
     max_episode_blocks: int = -1,
     max_episode_length_frames: int | None = None,
     max_pre_tf_tokens: int | None = None,
-    video_backend: str | None = None,
+    video_backend: str | None = "pyav",
     video_decoder_cache_size: int = 64,
     video_decoder_open_mode: str = "fsspec",
     worker_restart_every_n: int | None = None,
@@ -229,7 +229,9 @@ def get_action_droid_sft_dataset(
     filter).
 
     Reads ``root`` (a merged/versioned DROID LeRobot root) as a single flat
-    dataset; ``use_success_only=True`` filters to the ``success/`` split."""
+    dataset; ``use_success_only=True`` filters to the ``success/`` split.
+    Video decode defaults to ``video_backend='pyav'`` (pass ``'torchcodec'``
+    to use LeRobot's torchcodec path)."""
     shard_kwargs = dict(
         fps=fps,
         chunk_length=chunk_length,

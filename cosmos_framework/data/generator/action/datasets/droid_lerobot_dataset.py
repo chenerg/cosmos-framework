@@ -120,7 +120,7 @@ class DROIDLeRobotDataset(BaseActionLeRobotDataset):
         use_image_augmentation: bool = False,
         max_episode_blocks: int = -1,
         max_episode_length_frames: int | None = None,
-        video_backend: str | None = None,
+        video_backend: str | None = "pyav",
         video_decoder_cache_size: int = 64,
         video_decoder_open_mode: str = "fsspec",
     ) -> None:

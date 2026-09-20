@@ -20,6 +20,10 @@ from typing import Any
 
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
+from cosmos_framework.data.generator.action.datasets.agibot_lerobot_dataset import (
+    DEFAULT_AGIBOT_ROOT,
+    AgiBotLeRobotDataset,
+)
 from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot import (
     max_frames_for_pre_tf_sequence_length,
 )
@@ -30,11 +34,20 @@ from cosmos_framework.data.generator.action.datasets.robotwin_lerobot_dataset im
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 from cosmos_framework.utils import log
 
-# DROID concat_view after ActionTransformPipeline resize/pad, then Wan VAE÷16
+# Concat_view after ActionTransformPipeline resize/pad, then Wan VAE÷16
 # and patch_spatial=2. Used to turn a pre-TF token budget into a frame cap.
 _DROID_CONCAT_SPATIAL_TOKENS: dict[str, int] = {
     "256": 80,  # 320×256
     "480": 391,  # 736×544
+}
+# AgiBot concat is 720×640 (head 480×640 on top, wrists half-height below).
+# Closest VIDEO_RES_SIZE_INFO tier is 1:1 canvas (256×256 / 640×640), but
+# packing K is after ``_remove_padding_from_latent``: content is
+# letterboxed (256p 256×228, 480p 640×569), VAE÷16 floors, patch_spatial=2.
+# Full-canvas 64 / 400 over-counts vis tokens and under-caps T.
+_AGIBOT_CONCAT_SPATIAL_TOKENS: dict[str, int] = {
+    "256": 56,  # 256×228 content → 16×14 latent → 8×7
+    "480": 360,  # 640×569 content → 40×35 latent → 20×18
 }
 
 
@@ -42,25 +55,26 @@ def _resolve_max_episode_length_frames(
     max_episode_length_frames: int | None,
     max_pre_tf_tokens: int | None,
     resolution: str | int | None,
+    spatial_tokens_by_resolution: dict[str, int] | None = None,
 ) -> int | None:
     """Prefer an explicit frame cap; otherwise derive one from the token budget."""
     if max_episode_length_frames is not None:
         return max_episode_length_frames
     if max_pre_tf_tokens is None:
         return None
+    token_map = _DROID_CONCAT_SPATIAL_TOKENS if spatial_tokens_by_resolution is None else spatial_tokens_by_resolution
     res_key = str(resolution) if resolution is not None else ""
-    spatial = _DROID_CONCAT_SPATIAL_TOKENS.get(res_key)
+    spatial = token_map.get(res_key)
     if spatial is None:
         raise ValueError(
-            f"max_pre_tf_tokens={max_pre_tf_tokens} needs a known DROID concat_view "
+            f"max_pre_tf_tokens={max_pre_tf_tokens} needs a known concat_view "
             f"resolution to convert to frames; got {resolution!r}. Pass "
             f"max_episode_length_frames explicitly, or use resolution in "
-            f"{sorted(_DROID_CONCAT_SPATIAL_TOKENS)}."
+            f"{sorted(token_map)}."
         )
     cap = max_frames_for_pre_tf_sequence_length(max_pre_tf_tokens, spatial_tokens_per_latent=spatial)
     log.info(
-        f"max_pre_tf_tokens={max_pre_tf_tokens} resolution={res_key} "
-        f"(K={spatial}) -> max_episode_length_frames={cap}"
+        f"max_pre_tf_tokens={max_pre_tf_tokens} resolution={res_key} (K={spatial}) -> max_episode_length_frames={cap}"
     )
     return cap
 
@@ -167,10 +181,7 @@ class ActionIterableShuffleDataset(IterableDataset):
                 for idx in range(start, start + length):
                     yield self._dataset[idx]
                     yielded += 1
-                    if (
-                        self._worker_restart_every_n is not None
-                        and yielded >= self._worker_restart_every_n
-                    ):
+                    if self._worker_restart_every_n is not None and yielded >= self._worker_restart_every_n:
                         # End this iterator so DataLoader can respawn workers
                         # (persistent_workers=False) and FFmpeg native state dies
                         # with the process.
@@ -329,6 +340,90 @@ def get_action_droid_merged_lerobot_sft_dataset(
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_agibot_sft_dataset(
+    *,
+    root: str = DEFAULT_AGIBOT_ROOT,
+    fps: float = 15.0,
+    chunk_length: int = -1,
+    max_episode_blocks: int = -1,
+    max_episode_length_frames: int | None = None,
+    max_pre_tf_tokens: int | None = None,
+    action_space: str = "ee_pose",
+    mode: str = "policy",
+    use_state: bool = True,
+    action_normalization: str | None = None,
+    viewpoint: str = "concat_view",
+    use_image_augmentation: bool = False,
+    split: str = "train",
+    split_val_ratio: float = 0.03,
+    split_seed: int = 42,
+    resolution: str | int | None = None,
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = False,
+    format_prompt_as_json: bool = False,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+    video_backend: str | None = "pyav",
+    video_decoder_cache_size: int = 64,
+    video_decoder_open_mode: str = "fsspec",
+    worker_restart_every_n: int | None = None,
+) -> Dataset:
+    """Build the AgiBot action SFT dataset.
+
+    ``root`` is the ``Agibotworld/`` parent (``task_*/canonical_55d`` shards) or
+    a single LeRobot v3 directory. Whole-episode only (``chunk_length=-1``).
+    Default ``action_space='ee_pose'`` is the cookbook 29D FK layout;
+    ``joint_pos`` is 16D joints+grippers plus 9D head delta.
+    ``max_pre_tf_tokens`` uses the same frame-cap helper as DROID, with AgiBot
+    concat spatial tokens (256p ``K=56``, 480p ``K=360``; padding-cropped).
+    """
+    dataset: Dataset = AgiBotLeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        max_episode_blocks=max_episode_blocks,
+        max_episode_length_frames=_resolve_max_episode_length_frames(
+            max_episode_length_frames,
+            max_pre_tf_tokens,
+            resolution,
+            spatial_tokens_by_resolution=_AGIBOT_CONCAT_SPATIAL_TOKENS,
+        ),
+        split_seed=split_seed,
+        split_val_ratio=split_val_ratio,
+        split=split,
+        mode=mode,
+        action_space=action_space,
+        use_state=use_state,
+        action_normalization=action_normalization,
+        viewpoint=viewpoint,
+        use_image_augmentation=use_image_augmentation,
+        video_backend=video_backend,
+        video_decoder_cache_size=video_decoder_cache_size,
+        video_decoder_open_mode=video_decoder_open_mode,
+    )
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+    sft = ActionSFTDataset(dataset, transform, resolution)
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(
+            sft, seed=episode_shuffle_seed, worker_restart_every_n=worker_restart_every_n
+        )
     return sft
 
 
